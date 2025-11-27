@@ -5123,8 +5123,12 @@ class VCStep7_Location(discord.ui.View):
         if has_control:
             embed = discord.Embed(
                 title="🎭 VC管理システム セットアップ",
-                description="**ステップ 9/9: 操作チャンネル作成先カテゴリー選択**\n\n操作パネルを表示するテキストチャンネルを作成するカテゴリーを選択してください。",
-                color=0x5865F2)
+                description=(
+                    "**ステップ 9/9: 操作パネルの配置**\n\n"
+                    "作成したVCを管理する操作パネルを配置するカテゴリーを選択してください。"
+                ),
+                color=0x5865F2
+            )
             view = VCStep9_ControlCategory(
                 self.cog,
                 self.original_interaction,
@@ -5342,7 +5346,8 @@ class VCStep8_Category(discord.ui.View):
                     "**ステップ 9/9: 操作パネルの配置**\n\n"
                     "作成したVCを管理する操作パネルを配置するカテゴリーを選択してください。"
                 ),
-                color=0x5865F2)
+                color=0x5865F2
+            )
             view = VCStep9_ControlCategory(
                 self.cog,
                 self.original_interaction,
@@ -5353,12 +5358,14 @@ class VCStep8_Category(discord.ui.View):
                 self.hidden_role_ids,
                 self.selected_options,
                 self.locked_name,
+                self.delete_delay_minutes,
                 location_mode,
                 target_category_id,
                 self.notify_enabled,
                 self.notify_channel_id,
                 self.notify_category_id,
-                self.notify_role_id
+                self.notify_role_id,
+                notify_category_new=self.notify_category_new
             )
             await interaction.response.edit_message(embed=embed, view=view)
         else:
@@ -5401,8 +5408,30 @@ class VCStep8_Category(discord.ui.View):
             await interaction.response.edit_message(embed=embed, view=view)
 
 class VCStep9_ControlCategory(discord.ui.View):
-    """ステップ9: 操作チャンネル作成先カテゴリー選択"""
-    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, selected_options, locked_name, delete_delay_minutes, location_mode, target_category_id, notify_enabled=False, notify_channel_id=None, notify_category_id=None, notify_role_id=None, notify_category_new: bool = False):
+    """ステップ9: 操作チャンネル作成先カテゴリー選択（1つのドロップダウンに統合）"""
+
+    chunk_size = 24  # 24カテゴリ + 1つは「新しいカテゴリーを作成」用
+
+    def __init__(
+        self,
+        cog,
+        original_interaction,
+        vc_type,
+        user_limit,
+        hub_role_ids,
+        vc_role_ids,
+        hidden_role_ids,
+        selected_options,
+        locked_name,
+        delete_delay_minutes,
+        location_mode,
+        target_category_id,
+        notify_enabled: bool = False,
+        notify_channel_id=None,
+        notify_category_id=None,
+        notify_role_id=None,
+        notify_category_new: bool = False,
+    ):
         super().__init__(timeout=300)
         self.cog = cog
         self.original_interaction = original_interaction
@@ -5422,29 +5451,179 @@ class VCStep9_ControlCategory(discord.ui.View):
         self.notify_role_id = notify_role_id
         self.notify_category_new = notify_category_new
 
-        self.channel_select = discord.ui.ChannelSelect(
-            placeholder="操作パネルを配置するカテゴリーを選択",
-            channel_types=[discord.ChannelType.category],
-            min_values=1,
-            max_values=1
+        self.categories: List[discord.CategoryChannel] = list(original_interaction.guild.categories)
+        self.current_page: int = 0
+        self.total_pages: int = max(
+            1, math.ceil(len(self.categories) / self.chunk_size)
+        ) if self.categories else 1
+        self.category_select: Optional[discord.ui.Select] = None
+
+        self._build_dropdown()
+        self._build_controls()
+
+    def _build_controls(self) -> None:
+        """前後ページ移動などのボタン"""
+        self.prev_button = discord.ui.Button(
+            label="前の25件",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.total_pages <= 1,
+            row=1,
         )
-        self.channel_select.callback = self.on_select
-        self.add_item(self.channel_select)
-        self.add_item(VCControlCategoryCreateSelect(self))
+        self.prev_button.callback = self._go_prev  # type: ignore[assignment]
+        self.add_item(self.prev_button)
+
+        self.next_button = discord.ui.Button(
+            label="次の25件",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.total_pages <= 1,
+            row=1,
+        )
+        self.next_button.callback = self._go_next  # type: ignore[assignment]
+        self.add_item(self.next_button)
+
+        back_button = discord.ui.Button(
+            label="戻る（VC作成先カテゴリーに戻る）",
+            style=discord.ButtonStyle.secondary,
+            row=2,
+        )
+        back_button.callback = self._go_back_to_step8  # type: ignore[assignment]
+        self.add_item(back_button)
+
+    def _get_current_chunk(self) -> List[discord.CategoryChannel]:
+        if not self.categories:
+            return []
+        start = self.current_page * self.chunk_size
+        end = start + self.chunk_size
+        return self.categories[start:end]
+
+    def _build_dropdown(self) -> None:
+        """1つのSelectに「既存カテゴリ + 新規作成」をまとめる"""
+        if self.category_select:
+            self.remove_item(self.category_select)
+            self.category_select = None
+
+        chunk = self._get_current_chunk()
+        options: List[discord.SelectOption] = []
+
+        for category in chunk:
+            options.append(
+                discord.SelectOption(
+                    label=category.name[:100],
+                    value=str(category.id),
+                )
+            )
+
+        # 最後に「新しいカテゴリーを作成」を追加
+        options.append(
+            discord.SelectOption(
+                label="🆕 新しいカテゴリーを作成",
+                value="create",
+                description="操作パネル用のカテゴリーを新しく作成",
+            )
+        )
+
+        placeholder = (
+            f"操作パネルを配置するカテゴリーを選択 ({self.current_page + 1}/{self.total_pages})"
+        )
+        select = discord.ui.Select(
+            placeholder=placeholder,
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        select.callback = self.on_select  # type: ignore[assignment]
+        self.category_select = select
+        self.add_item(select)
+
+    async def _go_prev(self, interaction: discord.Interaction):
+        if self.total_pages <= 1:
+            await interaction.response.defer()
+            return
+        self.current_page = (self.current_page - 1) % self.total_pages
+        self._build_dropdown()
+        await interaction.response.edit_message(view=self)
+
+    async def _go_next(self, interaction: discord.Interaction):
+        if self.total_pages <= 1:
+            await interaction.response.defer()
+            return
+        self.current_page = (self.current_page + 1) % self.total_pages
+        self._build_dropdown()
+        await interaction.response.edit_message(view=self)
+
+    async def _go_back_to_step8(self, interaction: discord.Interaction):
+        """ステップ8のVC作成先カテゴリー選択に戻る"""
+        embed = VCStep8_Category(
+            self.cog,
+            self.original_interaction,
+            self.vc_type,
+            self.user_limit,
+            self.hub_role_ids,
+            self.vc_role_ids,
+            self.hidden_role_ids,
+            self.selected_options,
+            self.locked_name,
+            self.delete_delay_minutes,
+            self.notify_enabled,
+            self.notify_channel_id,
+            self.notify_category_id,
+            self.notify_role_id,
+            notify_category_new=self.notify_category_new,
+        ).build_embed()
+        view = VCStep8_Category(
+            self.cog,
+            self.original_interaction,
+            self.vc_type,
+            self.user_limit,
+            self.hub_role_ids,
+            self.vc_role_ids,
+            self.hidden_role_ids,
+            self.selected_options,
+            self.locked_name,
+            self.delete_delay_minutes,
+            self.notify_enabled,
+            self.notify_channel_id,
+            self.notify_category_id,
+            self.notify_role_id,
+            notify_category_new=self.notify_category_new,
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
 
     async def on_select(self, interaction: discord.Interaction):
-        if not self.channel_select.values:
+        if not self.category_select or not self.category_select.values:
+            await interaction.response.defer()
             return
-        category = self.channel_select.values[0]
+
+        value = self.category_select.values[0]
+        if value == "create":
+            # 新しいカテゴリーを作成するパターン
+            await self.show_summary(interaction, None, control_category_new=True)
+            return
+
+        try:
+            category_id = int(value)
+        except ValueError:
+            await interaction.response.send_message(
+                "カテゴリーを正しく選択してください。", ephemeral=True
+            )
+            return
+
+        category = interaction.guild.get_channel(category_id)
         if not isinstance(category, discord.CategoryChannel):
-            await interaction.response.send_message("カテゴリーを選択してください", ephemeral=True)
+            await interaction.response.send_message(
+                "カテゴリーを選択してください", ephemeral=True
+            )
             return
+
         await self.show_summary(interaction, category.id, control_category_new=False)
 
-    async def use_new_category(self, interaction: discord.Interaction):
-        await self.show_summary(interaction, None, control_category_new=True)
-
-    async def show_summary(self, interaction: discord.Interaction, control_category_id: Optional[int], control_category_new: bool):
+    async def show_summary(
+        self,
+        interaction: discord.Interaction,
+        control_category_id: Optional[int],
+        control_category_new: bool,
+    ):
         guild = self.original_interaction.guild
         embed = build_vc_summary_embed(
             guild,
@@ -5459,7 +5638,7 @@ class VCStep9_ControlCategory(discord.ui.View):
             self.location_mode,
             self.target_category_id,
             control_category_id,
-            control_category_new=control_category_new
+            control_category_new=control_category_new,
         )
         view = VCFinalConfirm(
             self.cog,
@@ -5480,23 +5659,9 @@ class VCStep9_ControlCategory(discord.ui.View):
             self.notify_category_id,
             self.notify_role_id,
             control_category_new=control_category_new,
-            notify_category_new=self.notify_category_new
+            notify_category_new=self.notify_category_new,
         )
         await interaction.response.edit_message(embed=embed, view=view)
-
-
-
-
-class VCControlCategoryCreateSelect(discord.ui.Select):
-    def __init__(self, parent_view: VCStep9_ControlCategory):
-        options = [
-            discord.SelectOption(label="🆕 新しいカテゴリーを作成", value="create", description="操作パネル用のカテゴリーを新しく作成")
-        ]
-        super().__init__(placeholder="新しいカテゴリーを作成する場合はこちら", options=options, min_values=1, max_values=1)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        await self.parent_view.use_new_category(interaction)
 
 
 async def setup(bot):
