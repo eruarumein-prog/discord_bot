@@ -51,7 +51,11 @@ class ServerDM(commands.Cog):
                 view = ServerDMView(self)
                 for item in view.children:
                     if isinstance(item, discord.ui.Button) and item.custom_id == custom_id:
-                        await item.callback(interaction)
+                        try:
+                            await item.callback(interaction)
+                        except Exception as e:
+                            # コールバック内で既にエラーハンドリングされている場合は、ここではログだけ
+                            logger.debug(f"DM作成ボタンコールバック後のエラー（既に処理済みの可能性）: {e}")
                         return
             
             # DM削除ボタンの場合
@@ -61,14 +65,22 @@ class ServerDM(commands.Cog):
                 view = DMDeleteView(self, channel_id)
                 for item in view.children:
                     if isinstance(item, discord.ui.Button):
-                        await item.callback(interaction)
+                        try:
+                            await item.callback(interaction)
+                        except Exception as e:
+                            # コールバック内で既にエラーハンドリングされている場合は、ここではログだけ
+                            logger.debug(f"DM削除ボタンコールバック後のエラー（既に処理済みの可能性）: {e}")
                         return
         except ValueError:
             logger.warning(f"無効なserverdm_delete ID: {interaction.data.get('custom_id')}")
-            await send_dm_error(interaction)
+            # 既に応答済みの場合はエラーメッセージを送信しない
+            if not interaction.response.is_done():
+                await send_dm_error(interaction)
         except Exception as e:
             logger.error(f"serverdm on_interaction エラー: {e}", exc_info=True)
-            await send_dm_error(interaction)
+            # 既に応答済みの場合はエラーメッセージを送信しない（正常処理後に発生する例外の可能性）
+            if not interaction.response.is_done():
+                await send_dm_error(interaction)
     
     @app_commands.command(name="serverdm", description="サーバー内DM作成操作盤を表示")
     @app_commands.describe(channel="操作盤を表示するチャンネル（省略可）")
@@ -521,9 +533,14 @@ class ServerDMView(discord.ui.View):
             
             modal = ServerDMModal(self.cog, interaction.user)
             await interaction.response.send_modal(modal)
+        except discord.InteractionResponded:
+            # 既に応答済みの場合は何もしない（正常処理の可能性）
+            logger.debug("DM作成ボタン: 既に応答済み")
         except Exception as e:
             logger.error(f"DM作成ボタンエラー: {e}", exc_info=True)
-            await send_dm_error(interaction)
+            # 既に応答済みの場合はエラーメッセージを送信しない
+            if not interaction.response.is_done():
+                await send_dm_error(interaction)
 
 
 class DMDeleteView(discord.ui.View):
@@ -548,21 +565,25 @@ class DMDeleteView(discord.ui.View):
             # チャンネルが存在するか確認
             channel = interaction.guild.get_channel(self.channel_id)
             if not channel:
-                await interaction.response.send_message("このチャンネルは既に削除されています", ephemeral=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("このチャンネルは既に削除されています", ephemeral=True)
                 return
             
             # 作成者かどうかを確認
             dm_data = self.cog.active_dms.get(self.channel_id)
             if not dm_data:
-                await interaction.response.send_message("このチャンネルの情報が見つかりません", ephemeral=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("このチャンネルの情報が見つかりません", ephemeral=True)
                 return
             
             creator_id = dm_data.get('creator_id', dm_data.get('user1_id'))  # 後方互換性のためuser1_idも確認
             if interaction.user.id != creator_id:
-                await interaction.response.send_message("❌ このチャンネルは作成者だけが削除できます", ephemeral=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ このチャンネルは作成者だけが削除できます", ephemeral=True)
                 return
             
-            await interaction.response.defer(ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
             
             # チャンネルを削除
             success = await self.cog.delete_dm_channel(self.channel_id)
@@ -580,9 +601,20 @@ class DMDeleteView(discord.ui.View):
                 else:
                     raise
                 
+        except discord.InteractionResponded:
+            # 既に応答済みの場合は何もしない（正常処理の可能性）
+            logger.debug("DM削除ボタン: 既に応答済み")
         except Exception as e:
             logger.error(f"削除ボタンエラー: {e}", exc_info=True)
-            await send_dm_error(interaction)
+            # 既に応答済みの場合はエラーメッセージを送信しない
+            if not interaction.response.is_done():
+                await send_dm_error(interaction)
+            else:
+                # followupで送信を試みる（失敗しても無視）
+                try:
+                    await interaction.followup.send("❌ DMチャンネルの削除中にエラーが発生しました。", ephemeral=True)
+                except Exception:
+                    pass
 
 
 class ServerDMModal(discord.ui.Modal, title="サーバー内DM作成"):
@@ -650,9 +682,20 @@ class ServerDMModal(discord.ui.Modal, title="サーバー内DM作成"):
                     ephemeral=True
                 )
                 
+        except discord.InteractionResponded:
+            # 既に応答済みの場合は何もしない（正常処理の可能性）
+            logger.debug("DM作成モーダル: 既に応答済み")
         except Exception as e:
             logger.error(f"DM作成モーダルエラー: {e}", exc_info=True)
-            await send_dm_error(interaction)
+            # 既に応答済みの場合はエラーメッセージを送信しない
+            if not interaction.response.is_done():
+                await send_dm_error(interaction)
+            else:
+                # followupで送信を試みる（失敗しても無視）
+                try:
+                    await interaction.followup.send("❌ DMチャンネルの作成中にエラーが発生しました。", ephemeral=True)
+                except Exception:
+                    pass
 
 
 async def setup(bot: commands.Bot):

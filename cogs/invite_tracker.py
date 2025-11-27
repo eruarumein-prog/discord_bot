@@ -98,15 +98,20 @@ class InviteTracker(commands.Cog):
     async def _initialize_state(self):
         await self.bot.wait_until_ready()
         try:
+            # データベースから監視対象を復元
+            watcher_count = 0
             for watcher in self.db.get_all_invite_watchers():
                 guild_map = self.watch_targets.setdefault(watcher['guild_id'], {})
                 guild_map[watcher['inviter_id']] = watcher['channel_id']
+                watcher_count += 1
 
+            # 各ギルドの招待リンクの現在の使用回数をキャッシュに同期（新しい参加者検知用）
             for guild in self.bot.guilds:
                 await self._sync_guild_invites(guild)
-            logger.info("招待監視情報を初期化しました")
+            
+            logger.info(f"✅ 招待監視情報を復元しました: {watcher_count}件の監視対象、{len(self.bot.guilds)}個のサーバーの招待リンクを同期（累計招待数はデータベースから引き継がれます）")
         except Exception as e:
-            logger.error(f"招待監視初期化エラー: {e}", exc_info=True)
+            logger.error(f"招待監視復元エラー: {e}", exc_info=True)
 
     async def _sync_guild_invites(self, guild: discord.Guild):
         """現在の招待状況をキャッシュ"""

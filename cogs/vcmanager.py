@@ -1110,7 +1110,7 @@ class VCManager(commands.Cog):
             logger.error(traceback.format_exc())
             raise
     
-    async def _create_vc_system_impl(self, guild: discord.Guild, vc_type: str, user_limit: int, hub_role_ids: List[int], vc_role_ids: List[int], hidden_role_ids: List[int], location_mode: str, target_category_id: Optional[int], source_channel, options: List[str], locked_name: Optional[str] = None, control_category_id: Optional[int] = None, notify_enabled: bool = False, notify_channel_id: Optional[int] = None, notify_category_id: Optional[int] = None, notify_role_id: Optional[int] = None, notify_category_new: bool = False, control_category_new: bool = False):
+    async def _create_vc_system_impl(self, guild: discord.Guild, vc_type: str, user_limit: int, hub_role_ids: List[int], vc_role_ids: List[int], hidden_role_ids: List[int], location_mode: str, target_category_id: Optional[int], source_channel, options: List[str], locked_name: Optional[str] = None, control_category_id: Optional[int] = None, notify_enabled: bool = False, notify_channel_id: Optional[int] = None, notify_category_id: Optional[int] = None, notify_role_id: Optional[int] = None, notify_category_new: bool = False, control_category_new: bool = False, delete_delay_minutes: Optional[int] = None):
         """VC管理システムを作成（内部実装）"""
         # source_channelがリストの場合は最初の要素を取得（エラー回避）
         if isinstance(source_channel, list):

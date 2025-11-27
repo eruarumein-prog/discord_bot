@@ -711,20 +711,29 @@ class TicketButtonView(discord.ui.View):
     
     async def create_ticket(self, interaction: discord.Interaction):
         try:
+            # 既に応答済みの場合はスキップ
+            if interaction.response.is_done():
+                return
+            
             for channel_id, data in self.cog.active_tickets.items():
                 if data['owner_id'] == interaction.user.id and data['guild_id'] == interaction.guild.id:
                     if not data.get('is_closed', False):
                         channel = interaction.guild.get_channel(channel_id)
                         if channel:
-                            await interaction.response.send_message(
-                                f"既にアクティブなチケットがあります: {channel.mention}", ephemeral=True
-                            )
+                            if not interaction.response.is_done():
+                                await interaction.response.send_message(
+                                    f"既にアクティブなチケットがあります: {channel.mention}", ephemeral=True
+                                )
                             return
-            await interaction.response.send_message("チケットを作成しています...", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("チケットを作成しています...", ephemeral=True)
             asyncio.create_task(self.cog.create_ticket(interaction.user, interaction.channel, self.system_data))
+        except discord.InteractionResponded:
+            logger.debug("チケット作成: 既に応答済み")
         except Exception as e:
             logger.error(f"チケット作成開始エラー: {e}", exc_info=True)
-            await send_ticket_error(interaction)
+            if not interaction.response.is_done():
+                await send_ticket_error(interaction)
 
 
 class TicketControlView(discord.ui.View):
@@ -777,14 +786,23 @@ class TicketControlView(discord.ui.View):
     @discord.ui.button(label="🗑️ 削除", style=discord.ButtonStyle.danger, custom_id="delete_ticket_button")
     async def delete_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            if not self.has_permission(interaction):
-                await interaction.response.send_message("❌ 権限なし", ephemeral=True)
+            # 既に応答済みの場合はスキップ
+            if interaction.response.is_done():
                 return
-            await interaction.response.send_message("✅ 削除します", ephemeral=True)
+            
+            if not self.has_permission(interaction):
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ 権限なし", ephemeral=True)
+                return
+            if not interaction.response.is_done():
+                await interaction.response.send_message("✅ 削除します", ephemeral=True)
             asyncio.create_task(self.cog.close_ticket(self.ticket_channel, interaction.user, save_log=False))
+        except discord.InteractionResponded:
+            logger.debug("チケット削除: 既に応答済み")
         except Exception as e:
             logger.error(f"delete_ticket ボタンエラー: {e}", exc_info=True)
-            await send_ticket_error(interaction)
+            if not interaction.response.is_done():
+                await send_ticket_error(interaction)
 
 
 async def setup(bot):
