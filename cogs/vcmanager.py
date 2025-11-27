@@ -1,12 +1,15 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from typing import Optional, List
+from typing import Optional, List, Tuple
+from dataclasses import dataclass
 import asyncio
 import sys
 import os
 import logging
 import traceback
+import math
+from datetime import datetime, timedelta
 from discord.errors import HTTPException, RateLimited, NotFound
 
 # ロガー設定
@@ -16,6 +19,17 @@ logger.setLevel(logging.INFO)
 # 親ディレクトリのdatabase.pyをインポート
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database import Database
+
+
+async def send_interaction_error(interaction: discord.Interaction, message: str = "エラーが発生しました。もう一度お試しください。"):
+    """安全にエラーを利用者へ通知"""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as send_err:
+        logger.error(f"エラー通知に失敗しました: {send_err}")
 
 class VCType:
     """VCのタイプ定数"""
@@ -31,6 +45,16 @@ class VCOption:
     NO_STATE_CONTROL = "状態操作なし"  # ロック、非表示、人数制限の操作を消す
     NO_JOIN_LEAVE_LOG = "入退室ログなし"  # 入退室ログを表示しない
     NO_OWNERSHIP_TRANSFER = "管理者譲渡なし"  # 管理者譲渡機能を無効化
+    DELAY_DELETE = "時間指定で削除"
+
+DELETE_DELAY_CHOICES: List[Tuple[int, str]] = [
+    (15, "15分"),
+    (30, "30分"),
+    (60, "1時間"),
+    (180, "3時間"),
+    (720, "12時間"),
+    (1440, "24時間"),
+]
 
 class VCLocationMode:
     """VC作成場所モード"""
@@ -76,6 +100,7 @@ class VCManager(commands.Cog):
         # 排他制御用ロック
         self.vc_creation_locks = {}  # {user_id: asyncio.Lock}
         self.db_lock = asyncio.Lock()  # データベース書き込み用
+        self.delayed_delete_tasks: dict[int, asyncio.Task] = {}
         # Bot起動時にデータを復元
         self.bot.loop.create_task(self.restore_from_database())
     
@@ -120,6 +145,7 @@ class VCManager(commands.Cog):
                 'notify_channel_id': system.get('notify_channel_id'),
                 'notify_role_id': system.get('notify_role_id'),
                 'control_category_id': system.get('control_category_id'),
+                'delete_delay_minutes': system.get('delete_delay_minutes'),
                 'name_counter': {}
             }
         
@@ -132,6 +158,7 @@ class VCManager(commands.Cog):
                 vc = guild.get_channel(vc_id)
                 if vc:
                     self.active_vcs[vc_id] = data
+                    self._restore_delayed_delete_task(vc_id)
                     found = True
                     break
             
@@ -150,7 +177,7 @@ class VCManager(commands.Cog):
         try:
             embed = discord.Embed(
                 title="🎭 VC管理システム セットアップ",
-                description="**ステップ 1/9: VCタイプ選択**\n\nVCのタイプを選択してください",
+                description="**ステップ 1/9: 人数制限の設定**\n\n作成されるVCに人数制限を付けるか選択してください。",
                 color=0x5865F2)
             view = VCStep1_Type(self, interaction)
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -181,8 +208,9 @@ class VCManager(commands.Cog):
             if before.channel.id in self.active_vcs:
                 non_bot_members = [m for m in before.channel.members if not m.bot]
                 if len(non_bot_members) == 0:
-                    logger.info(f"移動によりVCが空になったため削除します: {before.channel.name} (ID: {before.channel.id})")
-                    await self.delete_user_vc(before.channel)
+                    if self._can_delete_channel_now(before.channel):
+                        logger.info(f"移動によりVCが空になったため削除します: {before.channel.name} (ID: {before.channel.id})")
+                        await self.delete_user_vc(before.channel)
     
     async def handle_vc_join(self, member: discord.Member, channel: discord.VoiceChannel):
         """VC参加時の処理"""
@@ -240,7 +268,8 @@ class VCManager(commands.Cog):
         if channel.id in self.active_vcs:
             non_bot_members = [m for m in channel.members if not m.bot]
             if len(non_bot_members) == 0:
-                await self.delete_user_vc(channel)
+                if self._can_delete_channel_now(channel):
+                    await self.delete_user_vc(channel)
     
     async def create_and_move_user(self, member: discord.Member, hub_vc: discord.VoiceChannel, system_data: dict):
         """新しいVCを作成してユーザーを移動"""
@@ -269,6 +298,77 @@ class VCManager(commands.Cog):
             if not self.vc_creation_locks[user_id].locked():
                 del self.vc_creation_locks[user_id]
                 logger.debug(f"ロッククリーンアップ (ユーザーID: {user_id})")
+
+    def _parse_delete_ready_at(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    def _can_delete_channel_now(self, channel: discord.VoiceChannel) -> bool:
+        vc_data = self.active_vcs.get(channel.id)
+        if not vc_data:
+            return True
+        delay_minutes = vc_data.get('delete_delay_minutes')
+        if not delay_minutes:
+            return True
+        ready_at = self._parse_delete_ready_at(vc_data.get('delete_ready_at'))
+        if not ready_at:
+            return True
+        return datetime.utcnow() >= ready_at
+
+    def _schedule_delayed_delete_task(self, vc_id: int):
+        if vc_id in self.delayed_delete_tasks:
+            task = self.delayed_delete_tasks.pop(vc_id)
+            if task and not task.done():
+                task.cancel()
+        task = self.bot.loop.create_task(self._delayed_delete_worker(vc_id))
+        self.delayed_delete_tasks[vc_id] = task
+
+    def _restore_delayed_delete_task(self, vc_id: int):
+        vc_data = self.active_vcs.get(vc_id)
+        if not vc_data:
+            return
+        if not vc_data.get('delete_ready_at'):
+            return
+        self._schedule_delayed_delete_task(vc_id)
+
+    def _cancel_delayed_delete_task(self, vc_id: int):
+        task = self.delayed_delete_tasks.pop(vc_id, None)
+        if task and not task.done():
+            # 自分自身（実行中のタスク）をキャンセルすると削除処理が中断するので避ける
+            current = asyncio.current_task()
+            if task is not current:
+                task.cancel()
+
+    async def _delayed_delete_worker(self, vc_id: int):
+        try:
+            vc_data = self.active_vcs.get(vc_id)
+            if not vc_data:
+                return
+            ready_at = self._parse_delete_ready_at(vc_data.get('delete_ready_at'))
+            if not ready_at:
+                return
+            delay = (ready_at - datetime.utcnow()).total_seconds()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            vc = self.bot.get_channel(vc_id)
+            if not isinstance(vc, discord.VoiceChannel):
+                return
+            non_bot_members = [m for m in vc.members if not m.bot]
+            if non_bot_members:
+                # 削除猶予は経過しているので以降は通常の空チェックで削除される
+                return
+            await self.delete_user_vc(vc)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"遅延削除タスクエラー (VC ID: {vc_id}): {e}")
+        finally:
+            if vc_id in self.delayed_delete_tasks:
+                self.delayed_delete_tasks.pop(vc_id, None)
     
     def _channel_exists(self, channel: discord.abc.Connectable) -> bool:
         """チャンネルがまだ存在するかを確認"""
@@ -475,6 +575,13 @@ class VCManager(commands.Cog):
             'name_number': name_number,
             'system_data': system_data  # システムデータへの参照を保存
         }
+
+        delete_delay_minutes = system_data.get('delete_delay_minutes')
+        if delete_delay_minutes:
+            ready_at = datetime.utcnow() + timedelta(minutes=delete_delay_minutes)
+            self.active_vcs[new_vc.id]['delete_delay_minutes'] = delete_delay_minutes
+            self.active_vcs[new_vc.id]['delete_ready_at'] = ready_at.isoformat()
+            self._schedule_delayed_delete_task(new_vc.id)
         
         if not self._channel_exists(new_vc):
             logger.warning(f"作成したVCが既に存在しません (VC ID: {new_vc.id})。セットアップを中断します。")
@@ -983,6 +1090,7 @@ class VCManager(commands.Cog):
             
             # メモリから削除
             del self.active_vcs[channel.id]
+            self._cancel_delayed_delete_task(channel.id)
             logger.info(f"✅ VC削除完了 (ID: {channel.id})")
             
         except Exception as e:
@@ -991,18 +1099,18 @@ class VCManager(commands.Cog):
             print(f"❌ VC削除エラー: {e}")
             # エラーでもクラッシュしない
     
-    async def create_vc_system(self, guild: discord.Guild, vc_type: str, user_limit: int, hub_role_ids: List[int], vc_role_ids: List[int], hidden_role_ids: List[int], location_mode: str, target_category_id: Optional[int], source_channel, options: List[str], locked_name: Optional[str] = None, control_category_id: Optional[int] = None, notify_enabled: bool = False, notify_channel_id: Optional[int] = None, notify_category_id: Optional[int] = None, notify_role_id: Optional[int] = None):
+    async def create_vc_system(self, guild: discord.Guild, vc_type: str, user_limit: int, hub_role_ids: List[int], vc_role_ids: List[int], hidden_role_ids: List[int], location_mode: str, target_category_id: Optional[int], source_channel, options: List[str], locked_name: Optional[str] = None, control_category_id: Optional[int] = None, notify_enabled: bool = False, notify_channel_id: Optional[int] = None, notify_category_id: Optional[int] = None, notify_role_id: Optional[int] = None, notify_category_new: bool = False, control_category_new: bool = False, delete_delay_minutes: Optional[int] = None):
         """VC管理システムを作成"""
         try:
             logger.info(f"🚀 VC管理システム作成開始 (Guild: {guild.name}, Type: {vc_type})")
-            await self._create_vc_system_impl(guild, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, location_mode, target_category_id, source_channel, options, locked_name, control_category_id, notify_enabled, notify_channel_id, notify_category_id, notify_role_id)
+            await self._create_vc_system_impl(guild, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, location_mode, target_category_id, source_channel, options, locked_name, control_category_id, notify_enabled, notify_channel_id, notify_category_id, notify_role_id, notify_category_new, control_category_new, delete_delay_minutes)
             logger.info(f"✅ VC管理システム作成完了 (Guild: {guild.name})")
         except Exception as e:
             logger.error(f"❌ VC管理システム作成エラー (Guild: {guild.name}): {e}")
             logger.error(traceback.format_exc())
             raise
     
-    async def _create_vc_system_impl(self, guild: discord.Guild, vc_type: str, user_limit: int, hub_role_ids: List[int], vc_role_ids: List[int], hidden_role_ids: List[int], location_mode: str, target_category_id: Optional[int], source_channel, options: List[str], locked_name: Optional[str] = None, control_category_id: Optional[int] = None, notify_enabled: bool = False, notify_channel_id: Optional[int] = None, notify_category_id: Optional[int] = None, notify_role_id: Optional[int] = None):
+    async def _create_vc_system_impl(self, guild: discord.Guild, vc_type: str, user_limit: int, hub_role_ids: List[int], vc_role_ids: List[int], hidden_role_ids: List[int], location_mode: str, target_category_id: Optional[int], source_channel, options: List[str], locked_name: Optional[str] = None, control_category_id: Optional[int] = None, notify_enabled: bool = False, notify_channel_id: Optional[int] = None, notify_category_id: Optional[int] = None, notify_role_id: Optional[int] = None, notify_category_new: bool = False, control_category_new: bool = False):
         """VC管理システムを作成（内部実装）"""
         # source_channelがリストの場合は最初の要素を取得（エラー回避）
         if isinstance(source_channel, list):
@@ -1098,7 +1206,25 @@ class VCManager(commands.Cog):
         
         # カテゴリーIDがない場合はハブVCのIDを使用
         storage_key = vc_target_category_id if vc_target_category_id else hub_vc.id
+        final_notify_category_id = notify_category_id
+
+        if notify_enabled and notify_category_new:
+            try:
+                category = await guild.create_category("VC作成通知")
+                final_notify_category_id = category.id
+                logger.info(f"🆕 通知カテゴリーを作成: {category.name} (ID: {category.id})")
+            except Exception as e:
+                logger.error(f"通知カテゴリー作成エラー: {e}")
+                final_notify_category_id = None
         
+        if control_category_new:
+            try:
+                category = await guild.create_category("VC操作パネル")
+                control_category_id = category.id
+                logger.info(f"🆕 操作パネル用カテゴリーを作成: {category.name} (ID: {category.id})")
+            except Exception as e:
+                logger.error(f"操作パネルカテゴリー作成エラー: {e}")
+                control_category_id = None
         self.vc_systems[guild.id][storage_key] = {
             'hub_vc_id': hub_vc.id,
             'vc_type': vc_type,
@@ -1111,14 +1237,15 @@ class VCManager(commands.Cog):
             'options': options,
             'locked_name': locked_name,
             'control_category_id': control_category_id,
+            'delete_delay_minutes': delete_delay_minutes,
             'name_counter': {}
         }
         
         # notify_category_idが設定されている場合は、そのカテゴリー内に通知チャンネルを作成
         final_notify_channel_id = notify_channel_id
-        if notify_enabled and notify_category_id and not notify_channel_id:
+        if notify_enabled and final_notify_category_id and not notify_channel_id:
             try:
-                category = guild.get_channel(notify_category_id)
+                category = guild.get_channel(final_notify_category_id)
                 if isinstance(category, discord.CategoryChannel):
                     notify_channel = await category.create_text_channel("vc作成通知")
                     final_notify_channel_id = notify_channel.id
@@ -1147,10 +1274,11 @@ class VCManager(commands.Cog):
                     vc_target_category_id,
                     options,
                     locked_name,
-                    control_category_id=control_category_id,
                     notify_enabled=notify_enabled,
                     notify_channel_id=final_notify_channel_id,
-                    notify_role_id=notify_role_id
+                    notify_role_id=notify_role_id,
+                    control_category_id=control_category_id,
+                    delete_delay_minutes=delete_delay_minutes
                 )
             except Exception as e:
                 logger.error(f"❌ VCシステムDB保存エラー (Guild: {guild.name}): {e}")
@@ -1188,10 +1316,9 @@ class VCSetupView(discord.ui.View):
         self.add_item(HiddenRoleModeDropdown(self))
         # VCタイプ選択ドロップダウンを追加
         self.add_item(VCTypeSelectDropdown(self))
-        # 次へボタン、キャンセルボタン、ヘルプボタンを追加（最下部）
+        # 次へボタンとキャンセルボタンを追加（最下部）
         self.add_item(CreateButton(self))
         self.add_item(CancelButton(self))
-        self.add_item(HelpButton(self))
     
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """操作者チェック"""
@@ -1257,7 +1384,8 @@ class VCSetupView(discord.ui.View):
             self.target_category_id,
             self.source_channel,
             self.selected_options,
-            self.locked_name
+            self.locked_name,
+            control_category_new=False
         )
         
         await interaction.followup.send("✅ VC管理システムを作成しました", ephemeral=True)
@@ -1279,7 +1407,8 @@ class VCSetupView(discord.ui.View):
             self.target_category_id,
             self.source_channel,
             self.selected_options,
-            self.locked_name
+            self.locked_name,
+            control_category_new=False
         )
         
         await interaction.followup.send("✅ VC管理システムを作成しました", ephemeral=True)
@@ -2884,100 +3013,6 @@ class VCCategoryNextButton(discord.ui.Button):
         await interaction.response.edit_message(view=new_view)
 
 
-class HelpButton(discord.ui.Button):
-    """ヘルプボタン"""
-    
-    def __init__(self, parent_view: VCSetupView):
-        super().__init__(label="ヘルプ", style=discord.ButtonStyle.gray, row=4)
-        self.parent_view = parent_view
-    
-    async def callback(self, interaction: discord.Interaction):
-        help_embed = discord.Embed(
-            title="📖 VC管理システム セットアップガイド",
-            description="```\n各項目を設定して、自動VC作成システムを構築しましょう\n```",
-            color=0x5865F2
-        )
-        
-        # ロール設定
-        help_embed.add_field(
-            name="🎭 ロール設定",
-            value=(
-                "```yaml\n"
-                "ハブ参加権限ロール:\n"
-                "  - ハブVCに入れるロールを指定\n"
-                "  - 全員入室可能 / ロール限定\n\n"
-                "VC参加権限ロール:\n"
-                "  - 作成されたVCに入れるロールを指定\n"
-                "  - 全員入室可能 / ロール限定\n\n"
-                "閲覧可能ロール:\n"
-                "  - VCを閲覧できるロールを指定\n"
-                "  - 全員閲覧可能 / ロール限定\n"
-                "  - 指定ロールのみVCが表示されます\n"
-                "```"
-            ),
-            inline=False
-        )
-        
-        # VCタイプ
-        help_embed.add_field(
-            name="🔢 人数指定の有無",
-            value=(
-                "```diff\n"
-                "+ 人数指定なし (デフォルト)\n"
-                "  基本のVC、人数制限なし\n\n"
-                "+ 人数指定\n"
-                "  1～25人の人数制限付きVC\n"
-                "  作成時に人数を設定します\n"
-                "```"
-            ),
-            inline=False
-        )
-        
-        # オプション機能
-        help_embed.add_field(
-            name="⚙️ オプション機能（複数選択可）",
-            value=(
-                "```ini\n"
-                "[参加者専用チャット]\n"
-                "VC参加者のみが見えるテキストチャンネルを作成\n\n"
-                "[操作パネルなし]\n"
-                "VC作成時に操作パネルを表示しない\n\n"
-                "[満員時に非表示]\n"
-                "VCが満員になると自動で非表示になる\n\n"
-                "[名前変更制限]\n"
-                "VC名を固定（番号で管理）\n\n"
-                "[状態操作なし]\n"
-                "ロック・非表示・人数制限の操作を非表示\n\n"
-                "[入退室ログなし]\n"
-                "入退室ログを表示しない\n"
-                "```"
-            ),
-            inline=False
-        )
-        
-        # フロー説明
-        help_embed.add_field(
-            name="📝 セットアップの流れ",
-            value=(
-                "```markdown\n"
-                "1. 基本設定を選択（4つのドロップダウン）\n"
-                "2. ロール指定の場合、各ロールを選択\n"
-                "   - ハブ参加権限ロール\n"
-                "   - VC参加権限ロール\n"
-                "   - 閲覧可能ロール\n"
-                "3. オプション機能を選択（スキップ可）\n"
-                "4. カテゴリーを選択\n"
-                "5. 必要に応じてモーダル入力\n"
-                "6. VC管理システムが作成されます\n"
-                "```"
-            ),
-            inline=False
-        )
-        
-        help_embed.set_footer(text="💡 Tip: 選択内容は埋め込みに表示されます")
-        
-        await interaction.response.send_message(embed=help_embed, ephemeral=True)
-
 
 class VCLimitInputModal(discord.ui.Modal, title="人数制限を入力"):
     """VC作成時の人数入力モーダル"""
@@ -3896,103 +3931,223 @@ class VCStep1_Type(discord.ui.View):
         self.cog = cog
         self.original_interaction = original_interaction
         options = [
-            discord.SelectOption(label="人数指定なし", value="no_limit", description="人数制限なしのVC"),
-            discord.SelectOption(label="人数指定", value="with_limit", description="人数制限ありのVC")]
-        self.select = discord.ui.Select(placeholder="VCタイプを選択", options=options)
+            discord.SelectOption(label="人数制限なし", value="no_limit", description="作成されるVCごとの人数制限を設けない"),
+            discord.SelectOption(label="人数制限を付ける", value="with_limit", description="上限人数を決めてVCを作成")
+        ]
+        self.select = discord.ui.Select(placeholder="人数制限の有無を選択", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
-    
+
     async def on_select(self, interaction: discord.Interaction):
         try:
             vc_type = VCType.WITH_LIMIT if self.select.values[0] == "with_limit" else VCType.NO_LIMIT
             type_text = "人数指定" if vc_type == VCType.WITH_LIMIT else "人数指定なし"
-            
+
             if vc_type == VCType.WITH_LIMIT:
-                # 人数制限値入力へ
-                embed = discord.Embed(
-                    title="🎭 VC管理システム セットアップ",
-                    description=f"**ステップ 2/9: 人数制限値入力**\n\n✅ VCタイプ: **{type_text}**",
-                    color=0x5865F2)
-                view = VCStep2_UserLimit(self.cog, self.original_interaction, vc_type)
-                await interaction.response.edit_message(embed=embed, view=view)
+                modal = VCUserLimitModal(self.cog, self.original_interaction, vc_type)
+                await interaction.response.send_modal(modal)
             else:
-                # 次のステップへ
                 embed = discord.Embed(
                     title="🎭 VC管理システム セットアップ",
-                    description=f"**ステップ 3/9: ハブVCロール制限**\n\n✅ VCタイプ: **{type_text}**",
+                    description=f"**ステップ 3/9: VC作成権限**\n\n✅ VCタイプ: **{type_text}**\nVCを作成できるユーザーをロールで制限するか選択してください。",
                     color=0x5865F2)
                 view = VCStep3_HubRole(self.cog, self.original_interaction, vc_type, user_limit=0)
                 await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"VCタイプ選択エラー: {e}")
 
 
-class VCStep2_UserLimit(discord.ui.View):
-    """ステップ2: 人数制限値入力"""
-    def __init__(self, cog, original_interaction, vc_type):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.original_interaction = original_interaction
-        self.vc_type = vc_type
-        
-        # 人数入力ボタン
-        btn = discord.ui.Button(label="人数を入力（2-25人）", style=discord.ButtonStyle.primary)
-        btn.callback = self.open_modal
-        self.add_item(btn)
-        
-        # ヘルプボタン
-        help_btn = discord.ui.Button(label="ヘルプ", style=discord.ButtonStyle.secondary, row=1)
-        help_btn.callback = self.show_help
-        self.add_item(help_btn)
-    
-    async def show_help(self, interaction: discord.Interaction):
-        """ヘルプ表示"""
-        embed = discord.Embed(title="ヘルプ: 人数制限", color=0x00FF00)
-        embed.add_field(name="人数制限", value="作成されるVCの最大人数を設定します\n範囲: 2-25人", inline=False)
-        embed.add_field(name="例", value="4人 → 最大4人まで入れるVCが作成されます", inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-    async def open_modal(self, interaction: discord.Interaction):
-        try:
-            modal = VCUserLimitModal(self.cog, self.original_interaction, self.vc_type)
-            await interaction.response.send_modal(modal)
-        except:
-            pass
-
-
-class VCUserLimitModal(discord.ui.Modal, title="人数制限値入力"):
+class VCUserLimitModal(discord.ui.Modal, title="人数制限を入力"):
     """人数制限値入力モーダル"""
     limit_input = discord.ui.TextInput(
-        label="人数制限（2-25）", style=discord.TextStyle.short,
-        placeholder="例: 4", required=True, max_length=2, min_length=1)
-    
+        label="人数を指定してください（2〜25）",
+        style=discord.TextStyle.short,
+        placeholder="例: 4",
+        required=True,
+        max_length=2,
+        min_length=1
+    )
+
     def __init__(self, cog, original_interaction, vc_type):
         super().__init__()
         self.cog = cog
         self.original_interaction = original_interaction
         self.vc_type = vc_type
-    
+
     async def on_submit(self, interaction: discord.Interaction):
         try:
             user_limit = int(self.limit_input.value)
-            if user_limit < 2 or user_limit > 25:
-                await interaction.response.send_message("❌ 人数は2-25の範囲で入力してください", ephemeral=True)
-                return
-            
-            embed = discord.Embed(
-                title="🎭 VC管理システム セットアップ",
-                description=f"**ステップ 3/9: ハブVCロール制限**\n\n✅ VCタイプ: **人数指定**\n✅ 人数制限: **{user_limit}人**",
-                color=0x5865F2)
-            view = VCStep3_HubRole(self.cog, self.original_interaction, self.vc_type, user_limit)
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         except ValueError:
             await interaction.response.send_message("❌ 数値を入力してください", ephemeral=True)
-        except:
-            pass
+            return
 
+        if user_limit < 2 or user_limit > 25:
+            await interaction.response.send_message("❌ 人数は2-25の範囲で入力してください", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=False)
+        embed = discord.Embed(
+            title="🎭 VC管理システム セットアップ",
+            description=f"**ステップ 3/9: VC作成権限**\n\n✅ VCタイプ: **人数指定**\n✅ 人数制限: **{user_limit}人**\nVCを作成できるユーザーをロールで制限するか選択してください。",
+            color=0x5865F2)
+        view = VCStep3_HubRole(self.cog, self.original_interaction, self.vc_type, user_limit)
+        await self.original_interaction.edit_original_response(embed=embed, view=view)
+
+
+
+class PaginatedRoleSelectView(discord.ui.View):
+    """ロールを25件ずつ表示して選択する共通ビュー"""
+
+    chunk_size = 25
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        title: str,
+        description: str,
+        placeholder: str,
+        roles: List[discord.Role],
+        on_complete,
+        on_skip,
+        allow_empty_confirm: bool = False,
+        color: int = 0x5865F2,
+    ):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.title = title
+        self.description = description
+        self.placeholder = placeholder
+        self.available_roles = [role for role in roles if role and role != guild.default_role]
+        self.on_complete = on_complete
+        self.on_skip = on_skip
+        self.allow_empty_confirm = allow_empty_confirm
+        self.color = color
+        self.selected_role_ids: List[int] = []
+        self.current_page = 0
+        self.role_select: Optional[discord.ui.Select] = None
+        self.total_pages = max(1, math.ceil(len(self.available_roles) / self.chunk_size)) if self.available_roles else 1
+
+        self._build_role_dropdown()
+        self._build_controls()
+
+    def _build_controls(self):
+        self.prev_button = discord.ui.Button(label="前の25件", style=discord.ButtonStyle.secondary, disabled=self.total_pages <= 1, row=1)
+        self.prev_button.callback = self._go_prev
+        self.add_item(self.prev_button)
+
+        self.next_button = discord.ui.Button(label="次の25件", style=discord.ButtonStyle.secondary, disabled=self.total_pages <= 1, row=1)
+        self.next_button.callback = self._go_next
+        self.add_item(self.next_button)
+
+        self.confirm_button = discord.ui.Button(label="選択を確定", style=discord.ButtonStyle.success, row=2)
+        self.confirm_button.callback = self._confirm_selection
+        self.add_item(self.confirm_button)
+
+        self.skip_button = discord.ui.Button(label="スキップ（指定なし）", style=discord.ButtonStyle.secondary, row=2, disabled=self.on_skip is None)
+        self.skip_button.callback = self._skip_selection
+        self.add_item(self.skip_button)
+
+        self.clear_button = discord.ui.Button(label="選択をクリア", style=discord.ButtonStyle.danger, row=2)
+        self.clear_button.callback = self._clear_selection
+        self.add_item(self.clear_button)
+
+        if not self.available_roles:
+            self.confirm_button.disabled = not self.allow_empty_confirm
+            self.prev_button.disabled = True
+            self.next_button.disabled = True
+
+    def _build_role_dropdown(self):
+        if self.role_select:
+            self.remove_item(self.role_select)
+            self.role_select = None
+
+        chunk = self._get_current_chunk()
+        if not chunk:
+            return
+
+        options = [
+            discord.SelectOption(label=role.name[:100], value=str(role.id))
+            for role in chunk
+        ]
+        placeholder = f"{self.placeholder} ({self.current_page + 1}/{self.total_pages})"
+        select = discord.ui.Select(
+            placeholder=placeholder,
+            options=options,
+            min_values=0,
+            max_values=len(options),
+            row=0
+        )
+        select.callback = self._on_select
+        self.role_select = select
+        self.add_item(select)
+
+    def _get_current_chunk(self) -> List[discord.Role]:
+        if not self.available_roles:
+            return []
+        start = self.current_page * self.chunk_size
+        end = start + self.chunk_size
+        return self.available_roles[start:end]
+
+    def build_embed(self) -> discord.Embed:
+        summary = format_role_list(self.guild, self.selected_role_ids)
+        desc = f"{self.description}\n\n**現在の選択:** {summary}"
+        embed = discord.Embed(title=self.title, description=desc, color=self.color)
+        if self.available_roles:
+            embed.set_footer(text=f"ページ {self.current_page + 1}/{self.total_pages}")
+        else:
+            embed.set_footer(text="選択できるロールがありません")
+        return embed
+
+    async def _go_prev(self, interaction: discord.Interaction):
+        if self.total_pages <= 1:
+            await interaction.response.defer()
+            return
+        self.current_page = (self.current_page - 1) % self.total_pages
+        self._build_role_dropdown()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _go_next(self, interaction: discord.Interaction):
+        if self.total_pages <= 1:
+            await interaction.response.defer()
+            return
+        self.current_page = (self.current_page + 1) % self.total_pages
+        self._build_role_dropdown()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _clear_selection(self, interaction: discord.Interaction):
+        self.selected_role_ids.clear()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _skip_selection(self, interaction: discord.Interaction):
+        if not self.on_skip:
+            await interaction.response.send_message("スキップできません", ephemeral=True)
+            return
+        await self.on_skip(interaction)
+
+    async def _confirm_selection(self, interaction: discord.Interaction):
+        if not self.selected_role_ids and not self.allow_empty_confirm:
+            await interaction.response.send_message("少なくとも1つのロールを選択してください。", ephemeral=True)
+            return
+        if not self.on_complete:
+            await interaction.response.send_message("次のステップに進めませんでした。", ephemeral=True)
+            return
+        await self.on_complete(interaction, list(self.selected_role_ids))
+
+    async def _on_select(self, interaction: discord.Interaction):
+        updated = False
+        for value in getattr(self.role_select, 'values', []):
+            role_id = int(value)
+            if role_id not in self.selected_role_ids:
+                self.selected_role_ids.append(role_id)
+                updated = True
+        if updated:
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        else:
+            await interaction.response.defer()
 
 class VCStep3_HubRole(discord.ui.View):
-    """ステップ3: ハブVCロール制限"""
+    """ステップ3: VC作成権限"""
     def __init__(self, cog, original_interaction, vc_type, user_limit):
         super().__init__(timeout=300)
         self.cog = cog
@@ -4000,68 +4155,72 @@ class VCStep3_HubRole(discord.ui.View):
         self.vc_type = vc_type
         self.user_limit = user_limit
         options = [
-            discord.SelectOption(label="制限なし", value="none", description="全員がハブVCに入れる"),
-            discord.SelectOption(label="ロール指定", value="specify", description="特定のロールのみ入れる")]
-        self.select = discord.ui.Select(placeholder="ハブVCロール制限を選択", options=options)
+            discord.SelectOption(label="制限なし", value="none", description="誰でもハブVCからVCを作成できる"),
+            discord.SelectOption(label="ロール指定", value="specify", description="指定したロールだけがVCを作成できる")]
+        self.select = discord.ui.Select(placeholder="VC作成権限を選択", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
-    
+
+    def _build_next_embed(self, guild: discord.Guild, hub_role_ids: List[int]) -> discord.Embed:
+        role_text, count = summarize_role_names(guild, hub_role_ids)
+        if count == 0:
+            summary = "✅ VC作成: **制限なし**"
+        else:
+            summary = f"✅ VC作成: **{role_text}** ({count}件)"
+        description = (
+            "**ステップ 4/9: 入室ロール設定**\n\n"
+            f"{summary}\n"
+            "作成されたVCに入場できるロールを設定します。"
+        )
+        return discord.Embed(title="🎭 VC管理システム セットアップ", description=description, color=0x5865F2)
+
+    async def _proceed(self, interaction: discord.Interaction, hub_role_ids: List[int]):
+        embed = self._build_next_embed(interaction.guild, hub_role_ids)
+        view = VCStep4_VCRole(self.cog, self.original_interaction, self.vc_type, self.user_limit, hub_role_ids)
+        await interaction.response.edit_message(embed=embed, view=view)
+
     async def on_select(self, interaction: discord.Interaction):
         try:
             mode = self.select.values[0]
             if mode == "none":
-                embed = discord.Embed(
-                    title="🎭 VC管理システム セットアップ",
-                    description=f"**ステップ 4/9: 作成VCロール制限**\n\n✅ ハブVCロール: **制限なし**",
-                    color=0x5865F2)
-                view = VCStep4_VCRole(self.cog, self.original_interaction, self.vc_type, self.user_limit, hub_role_ids=[])
-                await interaction.response.edit_message(embed=embed, view=view)
-            else:
-                embed = discord.Embed(
-                    title="🎭 VC管理システム セットアップ",
-                    description=f"**ステップ 3-2/9: ハブVCロール選択**\n\nハブVCに入れるロールを選択",
-                    color=0x5865F2)
-                view = VCStep3_HubRoleSelect(self.cog, self.original_interaction, self.vc_type, self.user_limit)
-                await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
+                await self._proceed(interaction, [])
+                return
 
+            guild = interaction.guild
+            roles = [r for r in guild.roles if r != guild.default_role]
+            if not roles:
+                await self._proceed(interaction, [])
+                return
 
-class VCStep3_HubRoleSelect(discord.ui.View):
-    """ステップ3-2: ハブVCロール選択"""
-    def __init__(self, cog, original_interaction, vc_type, user_limit):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.original_interaction = original_interaction
-        self.vc_type = vc_type
-        self.user_limit = user_limit
-        roles = [r for r in original_interaction.guild.roles if r != original_interaction.guild.default_role][:25]
-        if roles:
-            self.select = discord.ui.Select(
-                placeholder="ハブVCに入れるロールを選択（複数可）", min_values=1, max_values=min(len(roles), 25),
-                options=[discord.SelectOption(label=r.name[:100], value=str(r.id)) for r in roles])
-            self.select.callback = self.on_select
-            self.add_item(self.select)
-    
-    async def on_select(self, interaction: discord.Interaction):
-        try:
-            hub_role_ids = [int(v) for v in self.select.values]
-            role_names = [interaction.guild.get_role(r).name for r in hub_role_ids if interaction.guild.get_role(r)]
-            role_text = ", ".join(role_names[:3])
-            if len(role_names) > 3:
-                role_text += f" 他{len(role_names)-3}件"
-            embed = discord.Embed(
+            async def handle_complete(select_interaction: discord.Interaction, selected_ids: List[int]):
+                valid_ids = [rid for rid in selected_ids if select_interaction.guild.get_role(rid)]
+                if not valid_ids:
+                    await select_interaction.response.send_message("選択したロールが見つかりませんでした。", ephemeral=True)
+                    return
+                await self._proceed(select_interaction, valid_ids)
+
+            async def handle_skip(skip_interaction: discord.Interaction):
+                await self._proceed(skip_interaction, [])
+
+            selector_view = PaginatedRoleSelectView(
+                guild=guild,
                 title="🎭 VC管理システム セットアップ",
-                description=f"**ステップ 4/9: 作成VCロール制限**\n\n✅ ハブVCロール: **{role_text}** ({len(role_names)}件)",
-                color=0x5865F2)
-            view = VCStep4_VCRole(self.cog, self.original_interaction, self.vc_type, self.user_limit, hub_role_ids)
-            await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
+                description=(
+                    "**ステップ 3-2/9: VC作成ロール選択**\n\n"
+                    "VCを作成できるロールを選択してください。必要なロールがなければスキップを押してください。"
+                ),
+                placeholder="VCを作成できるロールを選択",
+                roles=roles,
+                on_complete=handle_complete,
+                on_skip=handle_skip
+            )
+            await interaction.response.edit_message(embed=selector_view.build_embed(), view=selector_view)
+        except Exception as e:
+            logger.error(f"ハブVCロール選択エラー: {e}")
 
 
 class VCStep4_VCRole(discord.ui.View):
-    """ステップ4: 作成VCロール制限"""
+    """ステップ4: 入室ロール設定"""
     def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids):
         super().__init__(timeout=300)
         self.cog = cog
@@ -4070,69 +4229,72 @@ class VCStep4_VCRole(discord.ui.View):
         self.user_limit = user_limit
         self.hub_role_ids = hub_role_ids
         options = [
-            discord.SelectOption(label="制限なし", value="none", description="全員が作成VCに入れる"),
-            discord.SelectOption(label="ロール指定", value="specify", description="特定のロールのみ入れる")]
-        self.select = discord.ui.Select(placeholder="作成VCロール制限を選択", options=options)
+            discord.SelectOption(label="制限なし", value="none", description="作成されたVCに誰でも入室できる"),
+            discord.SelectOption(label="ロール指定", value="specify", description="指定したロールだけが入室できる")]
+        self.select = discord.ui.Select(placeholder="入室ロールの制限を選択", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
-    
+
+    def _build_step5_embed(self, guild: discord.Guild, vc_role_ids: List[int]) -> discord.Embed:
+        role_text, count = summarize_role_names(guild, vc_role_ids)
+        if count == 0:
+            summary = "✅ 入場ロール: **制限なし**"
+        else:
+            summary = f"✅ 入場ロール: **{role_text}** ({count}件)"
+        description = (
+            "**ステップ 5/9: 表示対象ロール**\n\n"
+            f"{summary}\n"
+            "VCを表示する相手を設定します。"
+        )
+        return discord.Embed(title="🎭 VC管理システム セットアップ", description=description, color=0x5865F2)
+
+    async def _proceed(self, interaction: discord.Interaction, vc_role_ids: List[int]):
+        embed = self._build_step5_embed(interaction.guild, vc_role_ids)
+        view = VCStep5_HiddenRole(self.cog, self.original_interaction, self.vc_type, self.user_limit, self.hub_role_ids, vc_role_ids)
+        await interaction.response.edit_message(embed=embed, view=view)
+
     async def on_select(self, interaction: discord.Interaction):
         try:
             mode = self.select.values[0]
             if mode == "none":
-                embed = discord.Embed(
-                    title="🎭 VC管理システム セットアップ",
-                    description=f"**ステップ 5/9: 閲覧可能ロール設定**\n\n✅ 作成VCロール: **制限なし**",
-                    color=0x5865F2)
-                view = VCStep5_HiddenRole(self.cog, self.original_interaction, self.vc_type, self.user_limit, self.hub_role_ids, vc_role_ids=[])
-                await interaction.response.edit_message(embed=embed, view=view)
-            else:
-                embed = discord.Embed(
-                    title="🎭 VC管理システム セットアップ",
-                    description=f"**ステップ 4-2/9: 作成VCロール選択**\n\n作成VCに入れるロールを選択",
-                    color=0x5865F2)
-                view = VCStep4_VCRoleSelect(self.cog, self.original_interaction, self.vc_type, self.user_limit, self.hub_role_ids)
-                await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
+                await self._proceed(interaction, [])
+                return
 
+            guild = interaction.guild
+            roles = [r for r in guild.roles if r != guild.default_role]
+            if not roles:
+                await self._proceed(interaction, [])
+                return
 
-class VCStep4_VCRoleSelect(discord.ui.View):
-    """ステップ4-2: 作成VCロール選択"""
-    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.original_interaction = original_interaction
-        self.vc_type = vc_type
-        self.user_limit = user_limit
-        self.hub_role_ids = hub_role_ids
-        roles = [r for r in original_interaction.guild.roles if r != original_interaction.guild.default_role][:25]
-        if roles:
-            self.select = discord.ui.Select(
-                placeholder="作成VCに入れるロールを選択（複数可）", min_values=1, max_values=min(len(roles), 25),
-                options=[discord.SelectOption(label=r.name[:100], value=str(r.id)) for r in roles])
-            self.select.callback = self.on_select
-            self.add_item(self.select)
-    
-    async def on_select(self, interaction: discord.Interaction):
-        try:
-            vc_role_ids = [int(v) for v in self.select.values]
-            role_names = [interaction.guild.get_role(r).name for r in vc_role_ids if interaction.guild.get_role(r)]
-            role_text = ", ".join(role_names[:3])
-            if len(role_names) > 3:
-                role_text += f" 他{len(role_names)-3}件"
-            embed = discord.Embed(
+            async def handle_complete(select_interaction: discord.Interaction, selected_ids: List[int]):
+                valid_ids = [rid for rid in selected_ids if select_interaction.guild.get_role(rid)]
+                if not valid_ids:
+                    await select_interaction.response.send_message("選択したロールが見つかりませんでした。", ephemeral=True)
+                    return
+                await self._proceed(select_interaction, valid_ids)
+
+            async def handle_skip(skip_interaction: discord.Interaction):
+                await self._proceed(skip_interaction, [])
+
+            selector_view = PaginatedRoleSelectView(
+                guild=guild,
                 title="🎭 VC管理システム セットアップ",
-                description=f"**ステップ 5/9: 閲覧可能ロール設定**\n\n✅ 作成VCロール: **{role_text}** ({len(role_names)}件)",
-                color=0x5865F2)
-            view = VCStep5_HiddenRole(self.cog, self.original_interaction, self.vc_type, self.user_limit, self.hub_role_ids, vc_role_ids)
-            await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
+                description=(
+                    "**ステップ 4-2/9: 入室ロール選択**\n\n"
+                    "作成されたVCに入場できるロールを選択してください。必要なロールが無ければスキップできます。"
+                ),
+                placeholder="作成されたVCに入場できるロールを選択",
+                roles=roles,
+                on_complete=handle_complete,
+                on_skip=handle_skip
+            )
+            await interaction.response.edit_message(embed=selector_view.build_embed(), view=selector_view)
+        except Exception as e:
+            logger.error(f"入室ロール設定エラー: {e}")
 
 
 class VCStep5_HiddenRole(discord.ui.View):
-    """ステップ5: 閲覧可能ロール設定"""
+    """ステップ5: 表示対象ロール設定"""
     def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids):
         super().__init__(timeout=300)
         self.cog = cog
@@ -4143,69 +4305,71 @@ class VCStep5_HiddenRole(discord.ui.View):
         self.vc_role_ids = vc_role_ids
         options = [
             discord.SelectOption(label="全員に表示", value="none", description="VCを全員に表示"),
-            discord.SelectOption(label="ロール指定", value="specify", description="特定のロールのみ表示")]
-        self.select = discord.ui.Select(placeholder="閲覧可能ロールを選択", options=options)
+            discord.SelectOption(label="ロール指定", value="specify", description="指定したロールだけに表示")]
+        self.select = discord.ui.Select(placeholder="VCを表示する相手を選択", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
-    
+
+    def _build_step6_embed(self, guild: discord.Guild, hidden_role_ids: List[int]) -> discord.Embed:
+        role_text, count = summarize_role_names(guild, hidden_role_ids)
+        if count == 0:
+            summary = "✅ 表示対象: **全員**"
+        else:
+            summary = f"✅ 表示対象: **{role_text}** ({count}件)"
+        description = (
+            "**ステップ 6/9: VCオプション**\n\n"
+            f"{summary}\n"
+            "作成されるVCに適用するオプションを選択してください。"
+        )
+        return discord.Embed(title="🎭 VC管理システム セットアップ", description=description, color=0x5865F2)
+
+    async def _proceed(self, interaction: discord.Interaction, hidden_role_ids: List[int]):
+        embed = self._build_step6_embed(interaction.guild, hidden_role_ids)
+        view = VCStep6_Options(self.cog, self.original_interaction, self.vc_type, self.user_limit, self.hub_role_ids, self.vc_role_ids, hidden_role_ids)
+        await interaction.response.edit_message(embed=embed, view=view)
+
     async def on_select(self, interaction: discord.Interaction):
         try:
             mode = self.select.values[0]
             if mode == "none":
-                embed = discord.Embed(
-                    title="🎭 VC管理システム セットアップ",
-                    description=f"**ステップ 6/9: VCオプション選択**\n\n✅ 閲覧可能: **全員**",
-                    color=0x5865F2)
-                view = VCStep6_Options(self.cog, self.original_interaction, self.vc_type, self.user_limit, self.hub_role_ids, self.vc_role_ids, hidden_role_ids=[])
-                await interaction.response.edit_message(embed=embed, view=view)
-            else:
-                embed = discord.Embed(
-                    title="🎭 VC管理システム セットアップ",
-                    description=f"**ステップ 5-2/9: 閲覧可能ロール選択**\n\nVCを表示するロールを選択",
-                    color=0x5865F2)
-                view = VCStep5_HiddenRoleSelect(self.cog, self.original_interaction, self.vc_type, self.user_limit, self.hub_role_ids, self.vc_role_ids)
-                await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
+                await self._proceed(interaction, [])
+                return
 
+            guild = interaction.guild
+            roles = [r for r in guild.roles if r != guild.default_role]
+            if not roles:
+                await self._proceed(interaction, [])
+                return
 
-class VCStep5_HiddenRoleSelect(discord.ui.View):
-    """ステップ5-2: 閲覧可能ロール選択"""
-    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.original_interaction = original_interaction
-        self.vc_type = vc_type
-        self.user_limit = user_limit
-        self.hub_role_ids = hub_role_ids
-        self.vc_role_ids = vc_role_ids
-        roles = [r for r in original_interaction.guild.roles if r != original_interaction.guild.default_role][:25]
-        if roles:
-            self.select = discord.ui.Select(
-                placeholder="VCを表示するロールを選択（複数可）", min_values=1, max_values=min(len(roles), 25),
-                options=[discord.SelectOption(label=r.name[:100], value=str(r.id)) for r in roles])
-            self.select.callback = self.on_select
-            self.add_item(self.select)
-    
-    async def on_select(self, interaction: discord.Interaction):
-        try:
-            hidden_role_ids = [int(v) for v in self.select.values]
-            role_names = [interaction.guild.get_role(r).name for r in hidden_role_ids if interaction.guild.get_role(r)]
-            role_text = ", ".join(role_names[:3])
-            if len(role_names) > 3:
-                role_text += f" 他{len(role_names)-3}件"
-            embed = discord.Embed(
+            async def handle_complete(select_interaction: discord.Interaction, selected_ids: List[int]):
+                valid_ids = [rid for rid in selected_ids if select_interaction.guild.get_role(rid)]
+                if not valid_ids:
+                    await select_interaction.response.send_message("選択したロールが見つかりませんでした。", ephemeral=True)
+                    return
+                await self._proceed(select_interaction, valid_ids)
+
+            async def handle_skip(skip_interaction: discord.Interaction):
+                await self._proceed(skip_interaction, [])
+
+            selector_view = PaginatedRoleSelectView(
+                guild=guild,
                 title="🎭 VC管理システム セットアップ",
-                description=f"**ステップ 6/9: VCオプション選択**\n\n✅ 閲覧可能: **{role_text}** ({len(role_names)}件)",
-                color=0x5865F2)
-            view = VCStep6_Options(self.cog, self.original_interaction, self.vc_type, self.user_limit, self.hub_role_ids, self.vc_role_ids, hidden_role_ids)
-            await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
+                description=(
+                    "**ステップ 5-2/9: 表示ロール選択**\n\n"
+                    "VCを表示するロールを選択してください。必要なロールが無ければスキップできます。"
+                ),
+                placeholder="VCを表示するロールを選択",
+                roles=roles,
+                on_complete=handle_complete,
+                on_skip=handle_skip
+            )
+            await interaction.response.edit_message(embed=selector_view.build_embed(), view=selector_view)
+        except Exception as e:
+            logger.error(f"表示対象ロール設定エラー: {e}")
 
 
 class VCStep6_Options(discord.ui.View):
-    """ステップ6: VCオプション選択"""
+    """ステップ6: VCオプション"""
     def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids):
         super().__init__(timeout=300)
         self.cog = cog
@@ -4223,9 +4387,11 @@ class VCStep6_Options(discord.ui.View):
             discord.SelectOption(label="名前変更制限", value=VCOption.LOCK_NAME, description="VC名を固定"),
             discord.SelectOption(label="状態操作なし", value=VCOption.NO_STATE_CONTROL, description="ロック等の操作を消す"),
             discord.SelectOption(label="入退室ログなし", value=VCOption.NO_JOIN_LEAVE_LOG, description="入退室ログを表示しない"),
-            discord.SelectOption(label="管理者譲渡なし", value=VCOption.NO_OWNERSHIP_TRANSFER, description="管理者譲渡機能を無効化")]
+            discord.SelectOption(label="管理者譲渡なし", value=VCOption.NO_OWNERSHIP_TRANSFER, description="管理者譲渡機能を無効化"),
+            discord.SelectOption(label="時間指定で削除", value=VCOption.DELAY_DELETE, description="一定時間経過後のみVCを削除")
+        ]
         self.select = discord.ui.Select(
-            placeholder="VCオプションを選択（複数可・スキップ可）", 
+            placeholder="作成されるVCに適用するオプションを選択（複数可・スキップ可）", 
             min_values=0, max_values=len(options), options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
@@ -4239,18 +4405,21 @@ class VCStep6_Options(discord.ui.View):
         try:
             selected_options = self.select.values if self.select.values else []
             await self.proceed(interaction, selected_options)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"オプション選択処理エラー(on_select): {e}", exc_info=True)
+            await send_interaction_error(interaction)
     
     async def on_skip(self, interaction: discord.Interaction):
         try:
             await self.proceed(interaction, [])
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"オプション選択処理エラー(on_skip): {e}", exc_info=True)
+            await send_interaction_error(interaction)
     
     async def proceed(self, interaction, selected_options):
         """次へ進む"""
         try:
+            need_delay_option = VCOption.DELAY_DELETE in selected_options
             # 名前変更制限がある場合は固定名入力へ
             if VCOption.LOCK_NAME in selected_options:
                 option_text = f"{len(selected_options)}個選択"
@@ -4261,244 +4430,271 @@ class VCStep6_Options(discord.ui.View):
                 view = VCStep6_LockedName(self.cog, self.original_interaction, self.vc_type, self.user_limit, 
                     self.hub_role_ids, self.vc_role_ids, self.hidden_role_ids, selected_options)
                 await interaction.response.edit_message(embed=embed, view=view)
+            elif need_delay_option:
+                delay_view = VCStep6_DeleteDelay(
+                    self.cog,
+                    self.original_interaction,
+                    self.vc_type,
+                    self.user_limit,
+                    self.hub_role_ids,
+                    self.vc_role_ids,
+                    self.hidden_role_ids,
+                    selected_options,
+                    locked_name=None
+                )
+                await interaction.response.edit_message(embed=delay_view.build_embed(), view=delay_view)
             else:
                 # 通知設定画面へ
-                option_text = f"{len(selected_options)}個選択" if selected_options else "なし"
-                embed = discord.Embed(
-                    title="🎭 VC管理システム セットアップ",
-                    description=f"**ステップ 6-3/9: VC作成通知設定**\n\n✅ オプション: **{option_text}**",
-                    color=0x5865F2)
-                view = VCStep6_Notify(self.cog, self.original_interaction, self.vc_type, self.user_limit,
-                    self.hub_role_ids, self.vc_role_ids, self.hidden_role_ids, selected_options, locked_name=None)
-                await interaction.response.edit_message(embed=embed, view=view)
+                notify_ctx = VCNotifyContext(
+                    cog=self.cog,
+                    original_interaction=self.original_interaction,
+                    vc_type=self.vc_type,
+                    user_limit=self.user_limit,
+                    hub_role_ids=self.hub_role_ids,
+                    vc_role_ids=self.vc_role_ids,
+                    hidden_role_ids=self.hidden_role_ids,
+                    selected_options=selected_options,
+                    locked_name=None
+                )
+                notify_view = VCNotifyEnableView(notify_ctx, VCNotifyConfig())
+                await interaction.response.edit_message(embed=notify_view.build_embed(), view=notify_view)
         except Exception as e:
             logger.error(f"オプション選択エラー: {e}")
 
 
-class VCStep6_Notify(discord.ui.View):
-    """ステップ6-3: VC作成通知設定"""
-    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, selected_options, locked_name=None):
+@dataclass
+class VCNotifyContext:
+    cog: "VCManager"
+    original_interaction: discord.Interaction
+    vc_type: "VCType"
+    user_limit: int
+    hub_role_ids: List[int]
+    vc_role_ids: List[int]
+    hidden_role_ids: List[int]
+    selected_options: List[str]
+    locked_name: Optional[str]
+    delete_delay_minutes: Optional[int] = None
+
+
+@dataclass
+class VCNotifyConfig:
+    enabled: bool = False
+    channel_id: Optional[int] = None
+    category_id: Optional[int] = None
+    role_id: Optional[int] = None
+    category_new: bool = False
+    new_category_name: str = "VC作成通知"
+
+
+def describe_notify_destination(guild: discord.Guild, config: VCNotifyConfig) -> str:
+    if config.category_new:
+        return f"{config.new_category_name}（新規作成）"
+    if config.channel_id:
+        channel = guild.get_channel(config.channel_id)
+        if hasattr(channel, "mention"):
+            return channel.mention  # type: ignore[attr-defined]
+        if channel:
+            return channel.name
+        return "選択したチャンネル"
+    if config.category_id:
+        category = guild.get_channel(config.category_id)
+        if category:
+            return f"{category.name}（カテゴリー）"
+        return "新しく作成されるカテゴリー"
+    return "未設定"
+
+
+class VCNotifyBaseView(discord.ui.View):
+    def __init__(self, ctx: VCNotifyContext, notify_config: VCNotifyConfig):
         super().__init__(timeout=300)
-        self.cog = cog
-        self.original_interaction = original_interaction
-        self.vc_type = vc_type
-        self.user_limit = user_limit
-        self.hub_role_ids = hub_role_ids
-        self.vc_role_ids = vc_role_ids
-        self.hidden_role_ids = hidden_role_ids
-        self.selected_options = selected_options
-        self.locked_name = locked_name
-        self.notify_enabled = False
-        self.notify_channel_id = None
-        self.notify_category_id = None  # 新カテゴリー作成の場合
-        self.notify_role_id = None
-        self.mention_mode = "none"  # "none" or "role"
-        
-        # 通知有効/無効切り替え
-        self.toggle_select = VCNotifyToggleSelect(self)
-        self.add_item(self.toggle_select)
-        
-        # 通知チャンネル選択（初期状態は無効）
-        self.channel_select = VCNotifyChannelSelect(self)
-        self.channel_select.disabled = True
-        self.add_item(self.channel_select)
-        
-        # メンション方法選択（初期状態は無効）
-        self.mention_select = VCNotifyMentionModeSelect(self)
-        self.mention_select.disabled = True
-        self.add_item(self.mention_select)
-        
-        # ロール選択（初期状態は無効）
-        self.role_select = VCNotifyRoleSelect(self)
-        self.role_select.disabled = True
-        self.add_item(self.role_select)
-        
-        # 次へボタン
-        next_btn = VCNotifyNextButton(self)
-        self.add_item(next_btn)
-    
-    def update_ui_state(self):
-        """UIの状態を更新"""
-        # 通知が有効な場合のみ、チャンネル選択とメンション方法選択を有効化
-        if self.notify_enabled:
-            self.channel_select.disabled = False
-            self.mention_select.disabled = False
-            # メンション方法がロールの場合のみロール選択を有効化
-            if self.mention_mode == "role":
-                self.role_select.disabled = False
-            else:
-                self.role_select.disabled = True
+        self.ctx = ctx
+        self.notify_config = notify_config
+
+    def _summary_texts(self) -> Tuple[str, str, str, str]:
+        option_text = f"{len(self.ctx.selected_options)}個選択" if self.ctx.selected_options else "なし"
+        locked_text = f"\n✅ 固定名: **{self.ctx.locked_name}**" if self.ctx.locked_name else ""
+        delay_text = ""
+        if self.ctx.delete_delay_minutes:
+            delay_label = format_delete_delay(self.ctx.delete_delay_minutes)
+            delay_text = f"\n⏱ 削除タイマー: **{delay_label}**"
+        notify_text = ""
+        if self.notify_config.enabled:
+            destination = describe_notify_destination(self.ctx.original_interaction.guild, self.notify_config)
+            notify_text = f"\n🔔 通知先: **{destination}**"
+            if self.notify_config.role_id:
+                role = self.ctx.original_interaction.guild.get_role(self.notify_config.role_id)
+                if role:
+                    notify_text += f"（{role.mention} をメンション）"
+        return option_text, locked_text, notify_text, delay_text
+
+    async def go_to_location_step(self, interaction: discord.Interaction):
+        option_text, locked_text, notify_text, delay_text = self._summary_texts()
+        embed = discord.Embed(
+            title="🎭 VC管理システム セットアップ",
+            description=(
+                "**ステップ 7/9: VC作成場所**\n\n"
+                "作成するVCを配置するカテゴリーを選択してください。"
+                f"\n✅ オプション: **{option_text}**{locked_text}{delay_text}{notify_text}"
+            ),
+            color=0x5865F2
+        )
+        view = VCStep7_Location(
+            self.ctx.cog,
+            self.ctx.original_interaction,
+            self.ctx.vc_type,
+            self.ctx.user_limit,
+            self.ctx.hub_role_ids,
+            self.ctx.vc_role_ids,
+            self.ctx.hidden_role_ids,
+            self.ctx.selected_options,
+            self.ctx.locked_name,
+            self.ctx.delete_delay_minutes,
+            self.notify_config.enabled,
+            self.notify_config.channel_id,
+            self.notify_config.category_id,
+            self.notify_config.role_id,
+            notify_category_new=self.notify_config.category_new
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class VCNotifyEnableView(VCNotifyBaseView):
+    def __init__(self, ctx: VCNotifyContext, notify_config: VCNotifyConfig):
+        super().__init__(ctx, notify_config)
+        yes_btn = discord.ui.Button(label="通知を送信する", style=discord.ButtonStyle.primary)
+        yes_btn.callback = self.enable_notify
+        self.add_item(yes_btn)
+        no_btn = discord.ui.Button(label="通知は送信しない", style=discord.ButtonStyle.secondary)
+        no_btn.callback = self.disable_notify
+        self.add_item(no_btn)
+
+    def build_embed(self) -> discord.Embed:
+        description = (
+            "**ステップ 6-3/9: 通知の有無**\n\n"
+            "VCが作成された際に案内メッセージを送信するか選択してください。"
+        )
+        return discord.Embed(title="🎭 VC管理システム セットアップ", description=description, color=0x5865F2)
+
+    async def enable_notify(self, interaction: discord.Interaction):
+        self.notify_config.enabled = True
+        view = VCNotifyChannelView(self.ctx, self.notify_config)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    async def disable_notify(self, interaction: discord.Interaction):
+        self.notify_config.enabled = False
+        await self.go_to_location_step(interaction)
+
+
+class VCNotifyChannelView(VCNotifyBaseView):
+    def __init__(self, ctx: VCNotifyContext, notify_config: VCNotifyConfig):
+        super().__init__(ctx, notify_config)
+        self.add_item(VCNotifyChannelSelect(self))
+        self.add_item(VCNotifyCategoryCreateSelect(self))
+
+    def build_embed(self) -> discord.Embed:
+        description = (
+            "**ステップ 6-3/9: 通知チャンネル**\n\n"
+            "通知を送信するテキストチャンネルを選択するか、専用カテゴリーを作成してください。"
+        )
+        return discord.Embed(title="🎭 VC管理システム セットアップ", description=description, color=0x5865F2)
+
+    async def proceed_to_mentions(self, interaction: discord.Interaction):
+        view = VCNotifyMentionView(self.ctx, self.notify_config)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    async def handle_new_category(self, interaction: discord.Interaction):
+        self.notify_config.category_new = True
+        self.notify_config.channel_id = None
+        self.notify_config.category_id = None
+        self.notify_config.new_category_name = "VC作成通知"
+        await self.proceed_to_mentions(interaction)
+
+
+class VCNotifyChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, parent_view: VCNotifyChannelView):
+        super().__init__(channel_types=[discord.ChannelType.text], placeholder="通知先のテキストチャンネルを選択", min_values=1, max_values=1)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values[0]
+        channel_id = getattr(selected, "id", None)
+        if channel_id is None:
+            channel_id = int(selected)
+        channel = interaction.guild.get_channel(channel_id)
+        if channel:
+            self.parent_view.notify_config.channel_id = channel.id
+            self.parent_view.notify_config.category_id = None
+            self.parent_view.notify_config.category_new = False
+            await self.parent_view.proceed_to_mentions(interaction)
         else:
-            self.channel_select.disabled = True
-            self.mention_select.disabled = True
-            self.role_select.disabled = True
+            await interaction.response.send_message("チャンネルの取得に失敗しました", ephemeral=True)
 
 
-class VCNotifyToggleSelect(discord.ui.Select):
-    """通知有効/無効切り替え"""
-    def __init__(self, parent_view: VCStep6_Notify):
+class VCNotifyCategoryCreateSelect(discord.ui.Select):
+    def __init__(self, parent_view: VCNotifyChannelView):
         options = [
-            discord.SelectOption(label="通知を有効にする", value="enabled", description="VC作成時に通知を送信"),
-            discord.SelectOption(label="通知を無効にする", value="disabled", description="通知を送信しない")]
-        super().__init__(placeholder="通知の有効/無効を選択", options=options, min_values=1, max_values=1)
+            discord.SelectOption(label="🆕 通知専用カテゴリーを作成", value="create", description="専用カテゴリーにチャンネルをまとめて作成")
+        ]
+        super().__init__(placeholder="新しいカテゴリーを作成する場合はこちら", options=options, min_values=1, max_values=1)
         self.parent_view = parent_view
-    
+
     async def callback(self, interaction: discord.Interaction):
-        try:
-            value = self.values[0]
-            self.parent_view.notify_enabled = (value == "enabled")
-            self.parent_view.update_ui_state()
-            
-            status = "有効" if self.parent_view.notify_enabled else "無効"
-            embed = discord.Embed(
-                title="🎭 VC管理システム セットアップ",
-                description=f"**ステップ 6-3/9: VC作成通知設定**\n\n✅ 通知: **{status}**",
-                color=0x5865F2)
-            await interaction.response.edit_message(embed=embed, view=self.parent_view)
-        except Exception as e:
-            logger.error(f"通知切り替えエラー: {e}")
+        await self.parent_view.handle_new_category(interaction)
 
 
-class VCNotifyChannelSelect(discord.ui.Select):
-    """通知チャンネル選択"""
-    def __init__(self, parent_view: VCStep6_Notify):
+class VCNotifyMentionView(VCNotifyBaseView):
+    def __init__(self, ctx: VCNotifyContext, notify_config: VCNotifyConfig):
+        super().__init__(ctx, notify_config)
+        role_btn = discord.ui.Button(label="ロールを指定する", style=discord.ButtonStyle.primary)
+        role_btn.callback = self.choose_role
+        self.add_item(role_btn)
+        none_btn = discord.ui.Button(label="メンションしない", style=discord.ButtonStyle.secondary)
+        none_btn.callback = self.choose_none
+        self.add_item(none_btn)
+
+    def build_embed(self) -> discord.Embed:
+        destination = describe_notify_destination(self.ctx.original_interaction.guild, self.notify_config)
+        description = (
+            "**ステップ 6-3/9: メンション設定**\n\n"
+            f"通知先: {destination}\n"
+            "通知を送信するときにロールをメンションするか選択してください。"
+        )
+        return discord.Embed(title="🎭 VC管理システム セットアップ", description=description, color=0x5865F2)
+
+    async def choose_none(self, interaction: discord.Interaction):
+        self.notify_config.role_id = None
+        await self.go_to_location_step(interaction)
+
+    async def choose_role(self, interaction: discord.Interaction):
+        view = VCNotifyRoleView(self.ctx, self.notify_config)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class VCNotifyRoleView(VCNotifyBaseView):
+    def __init__(self, ctx: VCNotifyContext, notify_config: VCNotifyConfig):
+        super().__init__(ctx, notify_config)
+        self.add_item(VCNotifyRolePicker(self))
+
+    def build_embed(self) -> discord.Embed:
+        description = (
+            "**ステップ 6-3/9: メンションするロール**\n\n"
+            "メンションに使用するロールを1つ選択してください。"
+        )
+        return discord.Embed(title="🎭 VC管理システム セットアップ", description=description, color=0x5865F2)
+
+    async def finish(self, interaction: discord.Interaction):
+        await self.go_to_location_step(interaction)
+
+
+class VCNotifyRolePicker(discord.ui.RoleSelect):
+    def __init__(self, parent_view: VCNotifyRoleView):
+        super().__init__(placeholder="メンションするロールを選択", min_values=1, max_values=1)
         self.parent_view = parent_view
-        # 既存のテキストチャンネルを取得
-        guild = parent_view.original_interaction.guild
-        text_channels = [ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages][:24]
-        
-        options = []
-        for ch in text_channels:
-            options.append(discord.SelectOption(
-                label=ch.name[:100],
-                value=str(ch.id),
-                description=f"#{ch.name}"
-            ))
-        # 新カテゴリー作成オプションを追加
-        options.append(discord.SelectOption(
-            label="新カテゴリーを作成",
-            value="new_category",
-            description="新しいカテゴリーを作成して通知チャンネルを作成"
-        ))
-        
-        super().__init__(placeholder="通知を送信するチャンネルを選択", options=options, min_values=1, max_values=1)
-    
+
     async def callback(self, interaction: discord.Interaction):
-        try:
-            value = self.values[0]
-            if value == "new_category":
-                # 新カテゴリーを自動作成
-                try:
-                    category = await interaction.guild.create_category("VC作成通知")
-                    self.parent_view.notify_category_id = category.id
-                    self.parent_view.notify_channel_id = None  # 後で作成
-                    
-                    embed = discord.Embed(
-                        title="🎭 VC管理システム セットアップ",
-                        description=f"**ステップ 6-3/9: VC作成通知設定**\n\n✅ 通知: **有効**\n📁 カテゴリー: **{category.name}** (作成済み)\n💬 通知チャンネルは後で作成されます",
-                        color=0x5865F2)
-                    await interaction.response.edit_message(embed=embed, view=self.parent_view)
-                except Exception as e:
-                    logger.error(f"通知カテゴリー作成エラー: {e}")
-                    await interaction.response.send_message("カテゴリーの作成に失敗しました", ephemeral=True)
-            else:
-                # 既存チャンネルを選択
-                channel_id = int(value)
-                channel = interaction.guild.get_channel(channel_id)
-                if channel:
-                    self.parent_view.notify_channel_id = channel.id
-                    self.parent_view.notify_category_id = None
-                    
-                    embed = discord.Embed(
-                        title="🎭 VC管理システム セットアップ",
-                        description=f"**ステップ 6-3/9: VC作成通知設定**\n\n✅ 通知: **有効**\n channel: **{channel.mention}**",
-                        color=0x5865F2)
-                    await interaction.response.edit_message(embed=embed, view=self.parent_view)
-        except Exception as e:
-            logger.error(f"通知チャンネル選択エラー: {e}")
-
-
-class VCNotifyMentionModeSelect(discord.ui.Select):
-    """メンション方法選択"""
-    def __init__(self, parent_view: VCStep6_Notify):
-        options = [
-            discord.SelectOption(label="メンションなし", value="none", description="ロールをメンションしない"),
-            discord.SelectOption(label="ロールをメンション", value="role", description="指定したロールをメンション")]
-        super().__init__(placeholder="メンション方法を選択", options=options, min_values=1, max_values=1)
-        self.parent_view = parent_view
-    
-    async def callback(self, interaction: discord.Interaction):
-        try:
-            value = self.values[0]
-            self.parent_view.mention_mode = value
-            self.parent_view.notify_role_id = None if value == "none" else self.parent_view.notify_role_id
-            self.parent_view.update_ui_state()
-            
-            mention_text = "なし" if value == "none" else "ロール"
-            embed = discord.Embed(
-                title="🎭 VC管理システム セットアップ",
-                description=f"**ステップ 6-3/9: VC作成通知設定**\n\n✅ 通知: **有効**\n🔔 メンション: **{mention_text}**",
-                color=0x5865F2)
-            await interaction.response.edit_message(embed=embed, view=self.parent_view)
-        except Exception as e:
-            logger.error(f"メンション方法選択エラー: {e}")
-
-
-class VCNotifyRoleSelect(discord.ui.RoleSelect):
-    """通知ロール選択"""
-    def __init__(self, parent_view: VCStep6_Notify):
-        super().__init__(placeholder="メンションするロールを選択")
-        self.parent_view = parent_view
-    
-    async def callback(self, interaction: discord.Interaction):
-        try:
-            role = self.values[0]
-            self.parent_view.notify_role_id = role.id
-            
-            embed = discord.Embed(
-                title="🎭 VC管理システム セットアップ",
-                description=f"**ステップ 6-3/9: VC作成通知設定**\n\n✅ 通知: **有効**\n🔔 ロール: **{role.mention}**",
-                color=0x5865F2)
-            await interaction.response.edit_message(embed=embed, view=self.parent_view)
-        except Exception as e:
-            logger.error(f"通知ロール選択エラー: {e}")
-
-
-class VCNotifyNextButton(discord.ui.Button):
-    """次へボタン"""
-    def __init__(self, parent_view: VCStep6_Notify):
-        super().__init__(label="次へ", style=discord.ButtonStyle.primary)
-        self.parent_view = parent_view
-    
-    async def callback(self, interaction: discord.Interaction):
-        try:
-            await self.proceed(interaction)
-        except Exception as e:
-            logger.error(f"通知設定次へエラー: {e}")
-    
-    async def proceed(self, interaction: discord.Interaction):
-        """次へ進む"""
-        try:
-            notify_enabled = self.parent_view.notify_enabled
-            notify_channel_id = self.parent_view.notify_channel_id if notify_enabled else None
-            notify_category_id = self.parent_view.notify_category_id if notify_enabled else None
-            notify_role_id = self.parent_view.notify_role_id if (notify_enabled and self.parent_view.mention_mode == "role") else None
-            
-            option_text = f"{len(self.parent_view.selected_options)}個選択" if self.parent_view.selected_options else "なし"
-            locked_text = f"\n✅ 固定名: **{self.parent_view.locked_name}**" if self.parent_view.locked_name else ""
-            notify_text = f"\n🔔 通知: **{'有効' if notify_enabled else '無効'}**" if notify_enabled else ""
-            
-            embed = discord.Embed(
-                title="🎭 VC管理システム セットアップ",
-                description=f"**ステップ 7/9: VC作成場所**\n\n✅ オプション: **{option_text}**{locked_text}{notify_text}",
-                color=0x5865F2)
-            view = VCStep7_Location(self.parent_view.cog, self.parent_view.original_interaction, self.parent_view.vc_type, 
-                self.parent_view.user_limit, self.parent_view.hub_role_ids, self.parent_view.vc_role_ids, 
-                self.parent_view.hidden_role_ids, self.parent_view.selected_options, self.parent_view.locked_name,
-                notify_enabled, notify_channel_id, notify_category_id, notify_role_id)
-            await interaction.response.edit_message(embed=embed, view=view)
-        except Exception as e:
-            logger.error(f"通知設定次へエラー: {e}")
+        role = self.values[0]
+        self.parent_view.notify_config.role_id = role.id
+        await self.parent_view.finish(interaction)
 
 
 class VCStep6_LockedName(discord.ui.View):
@@ -4523,8 +4719,9 @@ class VCStep6_LockedName(discord.ui.View):
             modal = VCLockedNameModal(self.cog, self.original_interaction, self.vc_type, self.user_limit,
                 self.hub_role_ids, self.vc_role_ids, self.hidden_role_ids, self.selected_options)
             await interaction.response.send_modal(modal)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"固定名入力モーダル表示エラー: {e}", exc_info=True)
+            await send_interaction_error(interaction)
 
 
 class VCLockedNameModal(discord.ui.Modal, title="固定名入力"):
@@ -4545,17 +4742,105 @@ class VCLockedNameModal(discord.ui.Modal, title="固定名入力"):
     
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            locked_name = self.name_input.value
-            option_text = f"{len(self.selected_options)}個選択" if self.selected_options else "なし"
-            embed = discord.Embed(
-                title="🎭 VC管理システム セットアップ",
-                description=f"**ステップ 6-3/9: VC作成通知設定**\n\n✅ オプション: **{option_text}**\n✅ 固定名: **{locked_name}**",
-                color=0x5865F2)
-            view = VCStep6_Notify(self.cog, self.original_interaction, self.vc_type, self.user_limit,
-                self.hub_role_ids, self.vc_role_ids, self.hidden_role_ids, self.selected_options, locked_name)
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        except:
-            pass
+            locked_name = self.name_input.value.strip()
+            if VCOption.DELAY_DELETE in self.selected_options:
+                delay_view = VCStep6_DeleteDelay(
+                    self.cog,
+                    self.original_interaction,
+                    self.vc_type,
+                    self.user_limit,
+                    self.hub_role_ids,
+                    self.vc_role_ids,
+                    self.hidden_role_ids,
+                    self.selected_options,
+                    locked_name
+                )
+                await self.original_interaction.edit_original_response(embed=delay_view.build_embed(), view=delay_view)
+            else:
+                notify_ctx = VCNotifyContext(
+                    cog=self.cog,
+                    original_interaction=self.original_interaction,
+                    vc_type=self.vc_type,
+                    user_limit=self.user_limit,
+                    hub_role_ids=self.hub_role_ids,
+                    vc_role_ids=self.vc_role_ids,
+                    hidden_role_ids=self.hidden_role_ids,
+                    selected_options=self.selected_options,
+                    locked_name=locked_name
+                )
+                notify_view = VCNotifyEnableView(notify_ctx, VCNotifyConfig())
+                await self.original_interaction.edit_original_response(embed=notify_view.build_embed(), view=notify_view)
+            await interaction.response.send_message("✅ 固定名を保存しました。", ephemeral=True, delete_after=5)
+        except Exception as e:
+            logger.error(f"固定名入力処理エラー: {e}", exc_info=True)
+            await send_interaction_error(interaction)
+
+
+class VCStep6_DeleteDelay(discord.ui.View):
+    """ステップ6: 削除タイマー設定"""
+    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, selected_options, locked_name):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.original_interaction = original_interaction
+        self.vc_type = vc_type
+        self.user_limit = user_limit
+        self.hub_role_ids = hub_role_ids
+        self.vc_role_ids = vc_role_ids
+        self.hidden_role_ids = hidden_role_ids
+        self.selected_options = selected_options
+        self.locked_name = locked_name
+
+        options = [
+            discord.SelectOption(label=label, value=str(value))
+            for value, label in DELETE_DELAY_CHOICES
+        ]
+        self.select = discord.ui.Select(
+            placeholder="VCを保持する時間を選択",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    def build_embed(self) -> discord.Embed:
+        description = (
+            "**ステップ 6-2/9: 削除タイマー**\n\n"
+            "VCを作成してからどれくらいの時間が経過したら削除できるかを選択してください。\n"
+            "指定時間を過ぎるまではユーザーが0人でもVCは残り、時間経過後に空になった時点で削除されます。"
+        )
+        return discord.Embed(title="🎭 VC管理システム セットアップ", description=description, color=0x5865F2)
+
+    async def on_select(self, interaction: discord.Interaction):
+        try:
+            if not self.select.values:
+                await interaction.response.defer()
+                return
+            minutes = int(self.select.values[0])
+            await self.proceed(interaction, minutes)
+        except Exception as e:
+            logger.error(f"削除タイマー選択エラー: {e}", exc_info=True)
+            await send_interaction_error(interaction)
+
+    async def proceed(self, interaction: discord.Interaction, minutes: int):
+        try:
+            notify_ctx = VCNotifyContext(
+                cog=self.cog,
+                original_interaction=self.original_interaction,
+                vc_type=self.vc_type,
+                user_limit=self.user_limit,
+                hub_role_ids=self.hub_role_ids,
+                vc_role_ids=self.vc_role_ids,
+                hidden_role_ids=self.hidden_role_ids,
+                selected_options=self.selected_options,
+                locked_name=self.locked_name,
+                delete_delay_minutes=minutes
+            )
+            notify_view = VCNotifyEnableView(notify_ctx, VCNotifyConfig())
+            await interaction.response.edit_message(embed=notify_view.build_embed(), view=notify_view)
+        except Exception as e:
+            logger.error(f"削除タイマー適用エラー: {e}", exc_info=True)
+            await send_interaction_error(interaction)
 
 
 def format_role_list(guild: discord.Guild, role_ids: List[int]) -> str:
@@ -4571,6 +4856,20 @@ def format_role_list(guild: discord.Guild, role_ids: List[int]) -> str:
     return ", ".join(names)
 
 
+
+def summarize_role_names(guild: discord.Guild, role_ids: List[int]) -> Tuple[str, int]:
+    names = []
+    for role_id in role_ids or []:
+        role = guild.get_role(role_id)
+        if role:
+            names.append(role.name)
+    count = len(names)
+    if not names:
+        return "なし", 0
+    if count > 3:
+        return ", ".join(names[:3]) + f" 他{count - 3}件", count
+    return ", ".join(names), count
+
 def format_options_text(options: List[str]) -> str:
     labels = {
         VCOption.TEXT_CHANNEL: "参加者専用チャット",
@@ -4579,6 +4878,7 @@ def format_options_text(options: List[str]) -> str:
         VCOption.LOCK_NAME: "名前変更制限",
         VCOption.NO_STATE_CONTROL: "状態操作なし",
         VCOption.NO_JOIN_LEAVE_LOG: "入退室ログなし",
+        VCOption.DELAY_DELETE: "時間指定で削除",
     }
     selected = [labels[opt] for opt in options or [] if opt in labels]
     if not selected:
@@ -4586,6 +4886,17 @@ def format_options_text(options: List[str]) -> str:
     if len(selected) > 5:
         return ", ".join(selected[:5]) + f" など{len(selected) - 5}件"
     return ", ".join(selected)
+
+
+def format_delete_delay(minutes: Optional[int]) -> str:
+    if not minutes:
+        return "なし"
+    for value, label in DELETE_DELAY_CHOICES:
+        if value == minutes:
+            return label
+    if minutes % 60 == 0:
+        return f"{minutes // 60}時間"
+    return f"{minutes}分"
 
 
 def describe_location(guild: discord.Guild, location_mode: str, target_category_id: Optional[int]) -> str:
@@ -4620,9 +4931,11 @@ def build_vc_summary_embed(
     hidden_role_ids: List[int],
     selected_options: List[str],
     locked_name: Optional[str],
+    delete_delay_minutes: Optional[int],
     location_mode: str,
     target_category_id: Optional[int],
     control_category_id: Optional[int],
+    control_category_new: bool = False,
 ) -> discord.Embed:
     embed = discord.Embed(
         title="設定内容の確認",
@@ -4634,19 +4947,22 @@ def build_vc_summary_embed(
     else:
         embed.add_field(name="VCタイプ", value="人数指定なし", inline=False)
     embed.add_field(name="ハブVCロール", value=format_role_list(guild, hub_role_ids), inline=False)
-    embed.add_field(name="作成VCロール", value=format_role_list(guild, vc_role_ids), inline=False)
-    embed.add_field(name="閲覧可能ロール", value=format_role_list(guild, hidden_role_ids), inline=False)
+    embed.add_field(name="入場ロール", value=format_role_list(guild, vc_role_ids), inline=False)
+    embed.add_field(name="表示対象ロール", value=format_role_list(guild, hidden_role_ids), inline=False)
     embed.add_field(name="オプション", value=format_options_text(selected_options), inline=False)
     embed.add_field(name="固定名", value=locked_name or "なし", inline=False)
+    embed.add_field(name="削除タイマー", value=format_delete_delay(delete_delay_minutes), inline=False)
     embed.add_field(
         name="VC作成場所",
         value=describe_location(guild, location_mode, target_category_id),
         inline=False
     )
-    # 操作パネルありの場合のみ制御チャンネルカテゴリーを表示
     has_control = VCOption.NO_CONTROL not in selected_options
     if has_control:
-        control_text = describe_control_category(guild, control_category_id)
+        if control_category_new:
+            control_text = "新しいカテゴリーを自動作成"
+        else:
+            control_text = describe_control_category(guild, control_category_id)
         embed.add_field(
             name="操作チャンネル作成先",
             value=control_text,
@@ -4667,6 +4983,7 @@ class VCFinalConfirm(discord.ui.View):
         hidden_role_ids,
         selected_options,
         locked_name,
+        delete_delay_minutes,
         location_mode,
         target_category_id,
         control_category_id,
@@ -4674,6 +4991,8 @@ class VCFinalConfirm(discord.ui.View):
         notify_channel_id=None,
         notify_category_id=None,
         notify_role_id=None,
+        control_category_new: bool = False,
+        notify_category_new: bool = False,
     ):
         super().__init__(timeout=300)
         self.cog = cog
@@ -4685,6 +5004,7 @@ class VCFinalConfirm(discord.ui.View):
         self.hidden_role_ids = hidden_role_ids
         self.selected_options = selected_options
         self.locked_name = locked_name
+        self.delete_delay_minutes = delete_delay_minutes
         self.location_mode = location_mode
         self.target_category_id = target_category_id
         self.control_category_id = control_category_id
@@ -4692,6 +5012,8 @@ class VCFinalConfirm(discord.ui.View):
         self.notify_channel_id = notify_channel_id
         self.notify_category_id = notify_category_id
         self.notify_role_id = notify_role_id
+        self.control_category_new = control_category_new
+        self.notify_category_new = notify_category_new
     
     async def _create_system(self, interaction: discord.Interaction):
         await self.cog.create_vc_system(
@@ -4706,11 +5028,14 @@ class VCFinalConfirm(discord.ui.View):
             self.original_interaction.channel,
             self.selected_options,
             self.locked_name,
+            delete_delay_minutes=self.delete_delay_minutes,
             control_category_id=self.control_category_id,
             notify_enabled=self.notify_enabled,
             notify_channel_id=self.notify_channel_id,
             notify_category_id=self.notify_category_id,
-            notify_role_id=self.notify_role_id
+            notify_role_id=self.notify_role_id,
+            notify_category_new=self.notify_category_new,
+            control_category_new=self.control_category_new
         )
     
     @discord.ui.button(label="作成", style=discord.ButtonStyle.success)
@@ -4741,7 +5066,7 @@ class VCFinalConfirm(discord.ui.View):
 
 class VCStep7_Location(discord.ui.View):
     """ステップ7: VC作成場所"""
-    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, selected_options, locked_name, notify_enabled=False, notify_channel_id=None, notify_category_id=None, notify_role_id=None):
+    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, selected_options, locked_name, delete_delay_minutes=None, notify_enabled=False, notify_channel_id=None, notify_category_id=None, notify_role_id=None, notify_category_new: bool = False):
         super().__init__(timeout=300)
         self.cog = cog
         self.original_interaction = original_interaction
@@ -4752,10 +5077,12 @@ class VCStep7_Location(discord.ui.View):
         self.hidden_role_ids = hidden_role_ids
         self.selected_options = selected_options
         self.locked_name = locked_name
+        self.delete_delay_minutes = delete_delay_minutes
         self.notify_enabled = notify_enabled
         self.notify_channel_id = notify_channel_id
         self.notify_category_id = notify_category_id
         self.notify_role_id = notify_role_id
+        self.notify_category_new = notify_category_new
         
         options = [
             discord.SelectOption(label="カテゴリー自動作成", value="auto", description="新しいカテゴリーを自動作成"),
@@ -4783,7 +5110,8 @@ class VCStep7_Location(discord.ui.View):
                     color=0x5865F2)
                 view = VCStep8_Category(self.cog, self.original_interaction, self.vc_type, self.user_limit,
                     self.hub_role_ids, self.vc_role_ids, self.hidden_role_ids, self.selected_options, self.locked_name,
-                    self.notify_enabled, self.notify_channel_id, self.notify_category_id, self.notify_role_id)
+                    self.delete_delay_minutes, self.notify_enabled, self.notify_channel_id, self.notify_category_id, self.notify_role_id,
+                    notify_category_new=self.notify_category_new)
                 await interaction.response.edit_message(embed=embed, view=view)
         except:
             pass
@@ -4807,12 +5135,14 @@ class VCStep7_Location(discord.ui.View):
                 self.hidden_role_ids,
                 self.selected_options,
                 self.locked_name,
+                self.delete_delay_minutes,
                 location_mode,
                 target_category_id,
                 self.notify_enabled,
                 self.notify_channel_id,
                 self.notify_category_id,
-                self.notify_role_id
+                self.notify_role_id,
+                notify_category_new=self.notify_category_new
             )
             if interaction.response.is_done():
                 await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -4830,9 +5160,11 @@ class VCStep7_Location(discord.ui.View):
                 self.hidden_role_ids,
                 self.selected_options,
                 self.locked_name,
+                self.delete_delay_minutes,
                 location_mode,
                 target_category_id,
-                None  # control_category_id
+                None,  # control_category_id
+                control_category_new=False
             )
             view = VCFinalConfirm(
                 self.cog,
@@ -4850,7 +5182,9 @@ class VCStep7_Location(discord.ui.View):
                 self.notify_enabled,
                 self.notify_channel_id,
                 self.notify_category_id,
-                self.notify_role_id
+                self.notify_role_id,
+                control_category_new=False,
+                notify_category_new=self.notify_category_new
             )
             if interaction.response.is_done():
                 await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -4860,7 +5194,9 @@ class VCStep7_Location(discord.ui.View):
 
 class VCStep8_Category(discord.ui.View):
     """ステップ8: カテゴリー選択"""
-    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, selected_options, locked_name, notify_enabled=False, notify_channel_id=None, notify_category_id=None, notify_role_id=None):
+    chunk_size = 25
+
+    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, selected_options, locked_name, delete_delay_minutes=None, notify_enabled=False, notify_channel_id=None, notify_category_id=None, notify_role_id=None, notify_category_new: bool = False):
         super().__init__(timeout=300)
         self.cog = cog
         self.original_interaction = original_interaction
@@ -4871,31 +5207,141 @@ class VCStep8_Category(discord.ui.View):
         self.hidden_role_ids = hidden_role_ids
         self.selected_options = selected_options
         self.locked_name = locked_name
+        self.delete_delay_minutes = delete_delay_minutes
         self.notify_enabled = notify_enabled
         self.notify_channel_id = notify_channel_id
         self.notify_category_id = notify_category_id
         self.notify_role_id = notify_role_id
-        
-        categories = [c for c in original_interaction.guild.categories][:25]
-        if categories:
-            self.select = discord.ui.Select(
-                placeholder="VC作成先カテゴリーを選択",
-                options=[discord.SelectOption(label=c.name[:100], value=str(c.id)) for c in categories])
-            self.select.callback = self.on_select
-            self.add_item(self.select)
-    
-    async def on_select(self, interaction: discord.Interaction):
-        if not self.select.values:
+        self.categories = list(original_interaction.guild.categories)
+        self.current_page = 0
+        self.category_select: Optional[discord.ui.Select] = None
+        self.total_pages = max(1, math.ceil(len(self.categories) / self.chunk_size)) if self.categories else 1
+
+        self._build_dropdown()
+        self._build_controls()
+
+    def _build_controls(self):
+        self.prev_button = discord.ui.Button(label="前の25件", style=discord.ButtonStyle.secondary, disabled=self.total_pages <= 1, row=1)
+        self.prev_button.callback = self._go_prev
+        self.add_item(self.prev_button)
+
+        self.next_button = discord.ui.Button(label="次の25件", style=discord.ButtonStyle.secondary, disabled=self.total_pages <= 1, row=1)
+        self.next_button.callback = self._go_next
+        self.add_item(self.next_button)
+
+        skip_button = discord.ui.Button(label="戻る（作成場所を選び直す）", style=discord.ButtonStyle.secondary, row=2)
+        skip_button.callback = self._return_to_location_step
+        self.add_item(skip_button)
+
+    def _build_dropdown(self):
+        if self.category_select:
+            self.remove_item(self.category_select)
+            self.category_select = None
+
+        chunk = self._get_current_chunk()
+        if not chunk:
             return
-        target_category_id = int(self.select.values[0])
+
+        options = [
+            discord.SelectOption(label=category.name[:100], value=str(category.id))
+            for category in chunk
+        ]
+        placeholder = f"VCを作成するカテゴリーを選択 ({self.current_page + 1}/{self.total_pages})"
+        select = discord.ui.Select(
+            placeholder=placeholder,
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0
+        )
+        select.callback = self.on_select
+        self.category_select = select
+        self.add_item(select)
+
+    def _get_current_chunk(self) -> List[discord.CategoryChannel]:
+        if not self.categories:
+            return []
+        start = self.current_page * self.chunk_size
+        end = start + self.chunk_size
+        return self.categories[start:end]
+
+    def build_embed(self) -> discord.Embed:
+        description = (
+            "**ステップ 8/9: VC作成先のカテゴリー**\n\n"
+            "VCを作成するカテゴリーを選択してください。カテゴリーが多い場合は前後のボタンでページを切り替えられます。"
+        )
+        embed = discord.Embed(title="🎭 VC管理システム セットアップ", description=description, color=0x5865F2)
+        if self.categories:
+            embed.set_footer(text=f"ページ {self.current_page + 1}/{self.total_pages}")
+        else:
+            embed.set_footer(text="選択できるカテゴリーがありません。戻るボタンで作成方法を変更できます。")
+        return embed
+
+    async def _go_prev(self, interaction: discord.Interaction):
+        if self.total_pages <= 1:
+            await interaction.response.defer()
+            return
+        self.current_page = (self.current_page - 1) % self.total_pages
+        self._build_dropdown()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _go_next(self, interaction: discord.Interaction):
+        if self.total_pages <= 1:
+            await interaction.response.defer()
+            return
+        self.current_page = (self.current_page + 1) % self.total_pages
+        self._build_dropdown()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _return_to_location_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="🎭 VC管理システム セットアップ",
+            description=(
+                "**ステップ 7/9: VC作成場所**\n\n"
+                "作成するVCをどのカテゴリーに配置するか選択してください。"
+            ),
+            color=0x5865F2
+        )
+        view = VCStep7_Location(
+            self.cog,
+            self.original_interaction,
+            self.vc_type,
+            self.user_limit,
+            self.hub_role_ids,
+            self.vc_role_ids,
+            self.hidden_role_ids,
+            self.selected_options,
+            self.locked_name,
+            self.delete_delay_minutes,
+            self.notify_enabled,
+            self.notify_channel_id,
+            self.notify_category_id,
+            self.notify_role_id,
+            notify_category_new=self.notify_category_new
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def on_select(self, interaction: discord.Interaction):
+        if not self.category_select or not self.category_select.values:
+            await interaction.response.defer()
+            return
+        category_id = int(self.category_select.values[0])
+        category = interaction.guild.get_channel(category_id)
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message("カテゴリーを選択してください", ephemeral=True)
+            return
+
+        target_category_id = category.id
         location_mode = VCLocationMode.SAME_CATEGORY
-        
-        # 操作パネルありの場合のみ制御チャンネルカテゴリー選択へ
+
         has_control = VCOption.NO_CONTROL not in self.selected_options
         if has_control:
             embed = discord.Embed(
                 title="🎭 VC管理システム セットアップ",
-                description="**ステップ 9/9: 操作チャンネル作成先カテゴリー選択**\n\n操作パネルを表示するテキストチャンネルを作成するカテゴリーを選択してください。",
+                description=(
+                    "**ステップ 9/9: 操作パネルの配置**\n\n"
+                    "作成したVCを管理する操作パネルを配置するカテゴリーを選択してください。"
+                ),
                 color=0x5865F2)
             view = VCStep9_ControlCategory(
                 self.cog,
@@ -4916,7 +5362,6 @@ class VCStep8_Category(discord.ui.View):
             )
             await interaction.response.edit_message(embed=embed, view=view)
         else:
-            # 操作パネルなしの場合は最終確認へ
             guild = self.original_interaction.guild
             embed = build_vc_summary_embed(
                 guild,
@@ -4929,7 +5374,8 @@ class VCStep8_Category(discord.ui.View):
                 self.locked_name,
                 location_mode,
                 target_category_id,
-                None  # control_category_id
+                None,
+                control_category_new=False
             )
             view = VCFinalConfirm(
                 self.cog,
@@ -4941,20 +5387,22 @@ class VCStep8_Category(discord.ui.View):
                 self.hidden_role_ids,
                 self.selected_options,
                 self.locked_name,
+                self.delete_delay_minutes,
                 location_mode,
                 target_category_id,
-                None,  # control_category_id
+                None,
                 self.notify_enabled,
                 self.notify_channel_id,
                 self.notify_category_id,
-                self.notify_role_id
+                self.notify_role_id,
+                control_category_new=False,
+                notify_category_new=self.notify_category_new
             )
             await interaction.response.edit_message(embed=embed, view=view)
 
-
 class VCStep9_ControlCategory(discord.ui.View):
     """ステップ9: 操作チャンネル作成先カテゴリー選択"""
-    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, selected_options, locked_name, location_mode, target_category_id, notify_enabled=False, notify_channel_id=None, notify_category_id=None, notify_role_id=None):
+    def __init__(self, cog, original_interaction, vc_type, user_limit, hub_role_ids, vc_role_ids, hidden_role_ids, selected_options, locked_name, delete_delay_minutes, location_mode, target_category_id, notify_enabled=False, notify_channel_id=None, notify_category_id=None, notify_role_id=None, notify_category_new: bool = False):
         super().__init__(timeout=300)
         self.cog = cog
         self.original_interaction = original_interaction
@@ -4965,112 +5413,90 @@ class VCStep9_ControlCategory(discord.ui.View):
         self.hidden_role_ids = hidden_role_ids
         self.selected_options = selected_options
         self.locked_name = locked_name
+        self.delete_delay_minutes = delete_delay_minutes
         self.location_mode = location_mode
         self.target_category_id = target_category_id
         self.notify_enabled = notify_enabled
         self.notify_channel_id = notify_channel_id
         self.notify_category_id = notify_category_id
         self.notify_role_id = notify_role_id
-        
-        categories = [c for c in original_interaction.guild.categories][:24]
-        options = [discord.SelectOption(label=c.name[:100], value=str(c.id)) for c in categories]
-        # 新カテゴリー作成オプションを追加
-        options.append(discord.SelectOption(
-            label="新カテゴリーを作成",
-            value="new_category",
-            description="新しいカテゴリーを作成"
-        ))
-        
-        if options:
-            self.select = discord.ui.Select(
-                placeholder="操作チャンネル作成先カテゴリーを選択",
-                options=options
-            )
-            self.select.callback = self.on_select
-            self.add_item(self.select)
-    
+        self.notify_category_new = notify_category_new
+
+        self.channel_select = discord.ui.ChannelSelect(
+            placeholder="操作パネルを配置するカテゴリーを選択",
+            channel_types=[discord.ChannelType.category],
+            min_values=1,
+            max_values=1
+        )
+        self.channel_select.callback = self.on_select
+        self.add_item(self.channel_select)
+        self.add_item(VCControlCategoryCreateSelect(self))
+
     async def on_select(self, interaction: discord.Interaction):
-        if not self.select.values:
+        if not self.channel_select.values:
             return
-        value = self.select.values[0]
-        
-        if value == "new_category":
-            # 新カテゴリーを自動作成
-            try:
-                category = await interaction.guild.create_category("VC操作パネル")
-                control_category_id = category.id
-                
-                guild = self.original_interaction.guild
-                embed = build_vc_summary_embed(
-                    guild,
-                    self.vc_type,
-                    self.user_limit,
-                    self.hub_role_ids,
-                    self.vc_role_ids,
-                    self.hidden_role_ids,
-                    self.selected_options,
-                    self.locked_name,
-                    self.location_mode,
-                    self.target_category_id,
-                    control_category_id
-                )
-                view = VCFinalConfirm(
-                    self.cog,
-                    self.original_interaction,
-                    self.vc_type,
-                    self.user_limit,
-                    self.hub_role_ids,
-                    self.vc_role_ids,
-                    self.hidden_role_ids,
-                    self.selected_options,
-                    self.locked_name,
-                    self.location_mode,
-                    self.target_category_id,
-                    control_category_id,
-                    self.notify_enabled,
-                    self.notify_channel_id,
-                    self.notify_category_id,
-                    self.notify_role_id
-                )
-                await interaction.response.edit_message(embed=embed, view=view)
-            except Exception as e:
-                logger.error(f"操作カテゴリー作成エラー: {e}")
-                await interaction.response.send_message("カテゴリーの作成に失敗しました", ephemeral=True)
-        else:
-            control_category_id = int(value)
-            guild = self.original_interaction.guild
-            embed = build_vc_summary_embed(
-                guild,
-                self.vc_type,
-                self.user_limit,
-                self.hub_role_ids,
-                self.vc_role_ids,
-                self.hidden_role_ids,
-                self.selected_options,
-                self.locked_name,
-                self.location_mode,
-                self.target_category_id,
-                control_category_id
-            )
-            view = VCFinalConfirm(
-                self.cog,
-                self.original_interaction,
-                self.vc_type,
-                self.user_limit,
-                self.hub_role_ids,
-                self.vc_role_ids,
-                self.hidden_role_ids,
-                self.selected_options,
-                self.locked_name,
-                self.location_mode,
-                self.target_category_id,
-                control_category_id,
-                self.notify_enabled,
-                self.notify_channel_id,
-                self.notify_category_id,
-                self.notify_role_id
-            )
-            await interaction.response.edit_message(embed=embed, view=view)
+        category = self.channel_select.values[0]
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message("カテゴリーを選択してください", ephemeral=True)
+            return
+        await self.show_summary(interaction, category.id, control_category_new=False)
+
+    async def use_new_category(self, interaction: discord.Interaction):
+        await self.show_summary(interaction, None, control_category_new=True)
+
+    async def show_summary(self, interaction: discord.Interaction, control_category_id: Optional[int], control_category_new: bool):
+        guild = self.original_interaction.guild
+        embed = build_vc_summary_embed(
+            guild,
+            self.vc_type,
+            self.user_limit,
+            self.hub_role_ids,
+            self.vc_role_ids,
+            self.hidden_role_ids,
+            self.selected_options,
+            self.locked_name,
+            self.delete_delay_minutes,
+            self.location_mode,
+            self.target_category_id,
+            control_category_id,
+            control_category_new=control_category_new
+        )
+        view = VCFinalConfirm(
+            self.cog,
+            self.original_interaction,
+            self.vc_type,
+            self.user_limit,
+            self.hub_role_ids,
+            self.vc_role_ids,
+            self.hidden_role_ids,
+            self.selected_options,
+            self.locked_name,
+            self.delete_delay_minutes,
+            self.location_mode,
+            self.target_category_id,
+            control_category_id,
+            self.notify_enabled,
+            self.notify_channel_id,
+            self.notify_category_id,
+            self.notify_role_id,
+            control_category_new=control_category_new,
+            notify_category_new=self.notify_category_new
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+
+
+class VCControlCategoryCreateSelect(discord.ui.Select):
+    def __init__(self, parent_view: VCStep9_ControlCategory):
+        options = [
+            discord.SelectOption(label="🆕 新しいカテゴリーを作成", value="create", description="操作パネル用のカテゴリーを新しく作成")
+        ]
+        super().__init__(placeholder="新しいカテゴリーを作成する場合はこちら", options=options, min_values=1, max_values=1)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.parent_view.use_new_category(interaction)
 
 
 async def setup(bot):

@@ -10,6 +10,20 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
+async def send_ticket_error(
+    interaction: discord.Interaction,
+    message: str = "エラーが発生しました。もう一度お試しください。"
+) -> None:
+    """チケット関連のエラーを安全に返信するヘルパー"""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as notify_err:
+        logger.error(f"チケットエラー通知に失敗: {notify_err}", exc_info=True)
+
 DEFAULT_PANEL_TITLE = "サポートチャット"
 DEFAULT_PANEL_DESCRIPTION = "ボタンを押してチャットを開始してください"
 DEFAULT_PANEL_BUTTON_LABEL = "💬 チャット開始"
@@ -137,8 +151,8 @@ class TicketManager(commands.Cog):
                 try:
                     if self.bot.get_guild(guild_id):
                         self.bot.add_view(TicketButtonView(self, system_data), message_id=message_id)
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"TicketButtonView 復元エラー guild={guild_id} message={message_id}: {e}", exc_info=True)
         for channel_id, data in list(self.active_tickets.items()):
             try:
                 guild = self.bot.get_guild(data['guild_id'])
@@ -147,8 +161,8 @@ class TicketManager(commands.Cog):
                     owner = guild.get_member(data['owner_id'])
                     if channel and owner:
                         self.bot.add_view(TicketControlView(channel, owner, self))
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"TicketControlView 復元エラー channel={channel_id}: {e}", exc_info=True)
         logger.info(f"✅ View復元完了")
     
     async def cleanup_ghost_tickets(self):
@@ -177,53 +191,68 @@ class TicketManager(commands.Cog):
             view = Step1_SupportRole(self, interaction, text_settings)
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         except Exception as e:
-            logger.error(f"エラー: {e}")
-            await interaction.response.send_message("❌ エラー", ephemeral=True)
+            logger.error(f"ticket_create エラー: {e}", exc_info=True)
+            await send_ticket_error(interaction, "❌ チケットシステムのセットアップ中にエラーが発生しました。")
     
     async def create_ticket(self, member, button_channel, system_data):
         """チケット作成"""
-        guild = member.guild
-        category_id = system_data.get('category_id')
-        category = guild.get_channel(category_id) if category_id else None
-        support_roles = system_data.get('support_roles', [])
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)}
-        for role_id in support_roles:
-            role = guild.get_role(role_id)
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-        if category:
-            channel = await category.create_text_channel(name=f"chat-{member.name}", overwrites=overwrites)
-        else:
-            channel = await guild.create_text_channel(name=f"chat-{member.name}", overwrites=overwrites)
-        self.active_tickets[channel.id] = {
-            'owner_id': member.id, 'guild_id': guild.id, 'created_from': button_channel.id,
-            'system_data': system_data, 'is_closed': False}
-        self.save_ticket(channel.id)
-        start_title = system_data.get('start_title') or DEFAULT_START_TITLE
-        start_description = system_data.get('start_description') or system_data.get('welcome_message') or DEFAULT_START_DESCRIPTION
-        embed = discord.Embed(title=start_title, description=start_description, color=0x5865F2)
-        view = TicketControlView(channel, member, self)
-        await channel.send(f"{member.mention}", embed=embed, view=view)
+        try:
+            guild = member.guild
+            category_id = system_data.get('category_id')
+            category = guild.get_channel(category_id) if category_id else None
+            support_roles = system_data.get('support_roles', [])
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True),
+            }
+            for role_id in support_roles:
+                role = guild.get_role(role_id)
+                if role:
+                    overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+            if category:
+                channel = await category.create_text_channel(name=f"chat-{member.name}", overwrites=overwrites)
+            else:
+                channel = await guild.create_text_channel(name=f"chat-{member.name}", overwrites=overwrites)
+            self.active_tickets[channel.id] = {
+                'owner_id': member.id,
+                'guild_id': guild.id,
+                'created_from': button_channel.id,
+                'system_data': system_data,
+                'is_closed': False,
+            }
+            self.save_ticket(channel.id)
+            start_title = system_data.get('start_title') or DEFAULT_START_TITLE
+            start_description = (
+                system_data.get('start_description')
+                or system_data.get('welcome_message')
+                or DEFAULT_START_DESCRIPTION
+            )
+            embed = discord.Embed(title=start_title, description=start_description, color=0x5865F2)
+            view = TicketControlView(channel, member, self)
+            await channel.send(f"{member.mention}", embed=embed, view=view)
+        except Exception as e:
+            logger.error(f"create_ticket エラー: {e}", exc_info=True)
     
     async def close_ticket(self, channel, closer, save_log=False):
         """チケット終了"""
-        if channel.id not in self.active_tickets:
-            return
-        if save_log:
-            self.active_tickets[channel.id]['is_closed'] = True
-            self.save_ticket(channel.id)
-            asyncio.create_task(channel.send(f"🔒 {closer.mention} が終了"))
-            asyncio.create_task(self._edit_closed_channel(channel))
-        else:
-            asyncio.create_task(channel.send(f"🗑️ 5秒後に削除"))
-            await asyncio.sleep(5)
-            await channel.delete()
-            if channel.id in self.active_tickets:
-                del self.active_tickets[channel.id]
-                self.delete_ticket(channel.id)
+        try:
+            if channel.id not in self.active_tickets:
+                return
+            if save_log:
+                self.active_tickets[channel.id]['is_closed'] = True
+                self.save_ticket(channel.id)
+                asyncio.create_task(channel.send(f"🔒 {closer.mention} が終了"))
+                asyncio.create_task(self._edit_closed_channel(channel))
+            else:
+                asyncio.create_task(channel.send(f"🗑️ 5秒後に削除"))
+                await asyncio.sleep(5)
+                await channel.delete()
+                if channel.id in self.active_tickets:
+                    del self.active_tickets[channel.id]
+                    self.delete_ticket(channel.id)
+        except Exception as e:
+            logger.error(f"close_ticket エラー: {e}", exc_info=True)
     
     async def _edit_closed_channel(self, channel):
         """終了処理"""
@@ -264,64 +293,50 @@ class TicketManager(commands.Cog):
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
         """再起動後もViewが動作するようにViewを再構築"""
-        if interaction.type != discord.InteractionType.component:
-            return
-        
-        # カスタムIDからViewの種類を判定
-        if not interaction.data or 'custom_id' not in interaction.data:
-            return
-        
-        # 既にacknowledgeされている場合はスキップ
-        if interaction.response.is_done():
-            return
-        
-        custom_id = interaction.data['custom_id']
-        
-        # チケット作成ボタンの場合
-        if custom_id == "create_ticket_button":
-            try:
+        try:
+            if interaction.type != discord.InteractionType.component:
+                return
+
+            if not interaction.data or 'custom_id' not in interaction.data:
+                return
+
+            custom_id = interaction.data['custom_id']
+
+            # チケット作成ボタンの場合
+            if custom_id == "create_ticket_button":
                 # メッセージIDからシステムデータを取得
                 message_id = interaction.message.id
                 guild_id = interaction.guild.id
-                
+
                 if guild_id in self.ticket_systems and message_id in self.ticket_systems[guild_id]:
                     system_data = self.ticket_systems[guild_id][message_id]
                     view = TicketButtonView(self, system_data)
-                    # コールバックを手動で呼び出す
                     for item in view.children:
                         if isinstance(item, discord.ui.Button) and item.custom_id == custom_id:
                             await item.callback(interaction)
                             return
-            except Exception as e:
-                logger.error(f"チケット作成ボタンエラー: {e}")
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("エラーが発生しました", ephemeral=True)
-        
-        # チケット操作ボタンの場合
-        elif custom_id in ["close_ticket_button", "reopen_ticket_button", "delete_ticket_button"]:
-            try:
+
+            # チケット操作ボタンの場合
+            elif custom_id in ["close_ticket_button", "reopen_ticket_button", "delete_ticket_button"]:
                 channel_id = interaction.channel.id
                 if channel_id not in self.active_tickets:
-                    await interaction.response.send_message("このチャンネルはチケットではありません", ephemeral=True)
+                    await send_ticket_error(interaction, "このチャンネルはチケットではありません。")
                     return
-                
+
                 data = self.active_tickets[channel_id]
                 owner = interaction.guild.get_member(data['owner_id'])
                 if not owner:
-                    await interaction.response.send_message("チケットの所有者が見つかりません", ephemeral=True)
+                    await send_ticket_error(interaction, "チケットの所有者が見つかりません。")
                     return
-                
+
                 view = TicketControlView(interaction.channel, owner, self)
-                # コールバックを手動で呼び出す
                 for item in view.children:
                     if isinstance(item, discord.ui.Button) and item.custom_id == custom_id:
                         await item.callback(interaction)
                         return
-            except Exception as e:
-                logger.error(f"チケット操作ボタンエラー: {e}")
-                logger.error(traceback.format_exc())
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("エラーが発生しました", ephemeral=True)
+        except Exception as e:
+            logger.error(f"on_interaction チケットハンドリングエラー: {e}", exc_info=True)
+            await send_ticket_error(interaction)
     
     async def _edit_reopened_channel(self, channel):
         """再開処理"""
@@ -368,17 +383,7 @@ class Step1_SupportRole(discord.ui.View):
         self.select.callback = self.on_select
         self.add_item(self.select)
         
-        # ヘルプボタン
-        help_btn = discord.ui.Button(label="ヘルプ", style=discord.ButtonStyle.secondary, row=1)
-        help_btn.callback = self.show_help
-        self.add_item(help_btn)
-    
-    async def show_help(self, interaction: discord.Interaction):
-        """ヘルプ表示"""
-        embed = discord.Embed(title="ヘルプ: サポートロール設定", color=0x00FF00)
-        embed.add_field(name="サポートロールなし", value="管理者のみがチケットを閲覧できます", inline=False)
-        embed.add_field(name="選択する", value="指定したロール（複数可）がチケットを閲覧できます\n例: @サポート, @モデレーター", inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     
     async def on_select(self, interaction: discord.Interaction):
         try:
@@ -391,11 +396,13 @@ class Step1_SupportRole(discord.ui.View):
                 embed = discord.Embed(
                     title="チケットシステム セットアップ",
                     description="**ステップ 1-2/4: サポートロール選択**\n\nサポートロールを選択してください（複数可）",
-                    color=0x5865F2)
+                    color=0x5865F2,
+                )
                 view = Step1_RoleSelect(self.cog, self.original_interaction, self.text_settings)
                 await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Step1_SupportRole on_select エラー: {e}", exc_info=True)
+            await send_ticket_error(interaction)
 
 
 class Step1_RoleSelect(discord.ui.View):
@@ -423,8 +430,9 @@ class Step1_RoleSelect(discord.ui.View):
             view = Step2_Message(self.cog, self.original_interaction, support_roles, self.text_settings, stage="panel")
             embed = view.build_embed()
             await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Step1_RoleSelect on_select エラー: {e}", exc_info=True)
+            await send_ticket_error(interaction)
 
 
 # ============================================================
@@ -465,10 +473,6 @@ class Step2_Message(discord.ui.View):
         )
         self.select.callback = self.on_select
         self.add_item(self.select)
-        
-        help_btn = discord.ui.Button(label="ヘルプ", style=discord.ButtonStyle.secondary, row=1)
-        help_btn.callback = self.show_help
-        self.add_item(help_btn)
     
     def build_embed(self):
         if self.stage == "panel":
@@ -476,10 +480,6 @@ class Step2_Message(discord.ui.View):
         else:
             desc = "**ステップ 2-2/4: チャット開始文言**\nデフォルトかカスタム入力を選択してください。"
         return discord.Embed(title="チケットシステム セットアップ", description=desc, color=0x5865F2)
-    
-    async def show_help(self, interaction: discord.Interaction):
-        embed = discord.Embed(title="ヘルプ: 文言設定", description=self.help_desc, color=0x00FF00)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
     
     def _apply_panel_defaults(self):
         self.text_settings["panel_title"] = DEFAULT_PANEL_TITLE
@@ -554,12 +554,16 @@ class PanelTextModal(discord.ui.Modal, title="パネル文言を設定"):
         self.parent_view = parent_view
     
     async def on_submit(self, interaction: discord.Interaction):
-        settings = self.parent_view.text_settings
-        settings["panel_title"] = (self.panel_title.value or DEFAULT_PANEL_TITLE).strip()
-        settings["panel_description"] = (self.panel_description.value or DEFAULT_PANEL_DESCRIPTION).strip()
-        settings["panel_button_label"] = (self.panel_button_label.value or DEFAULT_PANEL_BUTTON_LABEL).strip()
-        await interaction.response.defer(ephemeral=True)
-        await self.parent_view._show_chat_stage(interaction, from_modal=True)
+        try:
+            settings = self.parent_view.text_settings
+            settings["panel_title"] = (self.panel_title.value or DEFAULT_PANEL_TITLE).strip()
+            settings["panel_description"] = (self.panel_description.value or DEFAULT_PANEL_DESCRIPTION).strip()
+            settings["panel_button_label"] = (self.panel_button_label.value or DEFAULT_PANEL_BUTTON_LABEL).strip()
+            await interaction.response.send_message("✅ 受付パネルの文言を保存しました。", ephemeral=True, delete_after=5)
+            await self.parent_view._show_chat_stage(interaction, from_modal=True)
+        except Exception as e:
+            logger.error(f"PanelTextModal on_submit エラー: {e}", exc_info=True)
+            await send_ticket_error(interaction)
 
 
 class ChatStartTextModal(discord.ui.Modal, title="チャット開始文言を設定"):
@@ -582,14 +586,18 @@ class ChatStartTextModal(discord.ui.Modal, title="チャット開始文言を設
         self.parent_view = parent_view
     
     async def on_submit(self, interaction: discord.Interaction):
-        settings = self.parent_view.text_settings
-        start_title = (self.start_title.value or DEFAULT_START_TITLE).strip()
-        start_desc = (self.start_description.value or DEFAULT_START_DESCRIPTION).strip()
-        settings["start_title"] = start_title
-        settings["start_description"] = start_desc
-        settings["welcome_message"] = start_desc
-        await interaction.response.defer(ephemeral=True)
-        await self.parent_view._show_step3(interaction, from_modal=True)
+        try:
+            settings = self.parent_view.text_settings
+            start_title = (self.start_title.value or DEFAULT_START_TITLE).strip()
+            start_desc = (self.start_description.value or DEFAULT_START_DESCRIPTION).strip()
+            settings["start_title"] = start_title
+            settings["start_description"] = start_desc
+            settings["welcome_message"] = start_desc
+            await interaction.response.send_message("✅ チャット開始メッセージを保存しました。", ephemeral=True, delete_after=5)
+            await self.parent_view._show_step3(interaction, from_modal=True)
+        except Exception as e:
+            logger.error(f"ChatStartTextModal on_submit エラー: {e}", exc_info=True)
+            await send_ticket_error(interaction)
 
 
 # ============================================================
@@ -613,42 +621,6 @@ class Step3_Category(discord.ui.View):
         self.select.callback = self.on_select
         self.add_item(self.select)
         
-        # ヘルプボタン
-        help_btn = discord.ui.Button(label="ヘルプ", style=discord.ButtonStyle.secondary, row=1)
-        help_btn.callback = self.show_help
-        self.add_item(help_btn)
-    
-    async def show_help(self, interaction: discord.Interaction):
-        """ヘルプ表示"""
-        embed = discord.Embed(title="ヘルプ: チケット作成先カテゴリー", color=0x00FF00)
-        embed.add_field(name="新規カテゴリー作成", value="「サポートチケット」という新しいカテゴリーを自動作成します", inline=False)
-        embed.add_field(name="既存カテゴリー選択", value="選択したカテゴリー内にチケットチャンネルを作成します", inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-    async def on_select(self, interaction: discord.Interaction):
-        try:
-            if self.select.values[0] == "new":
-                # 新規カテゴリー作成
-                await interaction.response.defer(ephemeral=True, thinking=False)
-                category = await interaction.guild.create_category("サポートチケット")
-                category_id = category.id
-                embed = discord.Embed(
-                    title="チケットシステム セットアップ",
-                    description="**ステップ 4/4: ログ保存先カテゴリー**",
-                    color=0x5865F2)
-                view = Step4_ArchiveCategory(self.cog, self.original_interaction, self.support_roles, self.text_settings, category_id)
-                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-            else:
-                category_id = int(self.select.values[0])
-                embed = discord.Embed(
-                    title="チケットシステム セットアップ",
-                    description="**ステップ 4/4: ログ保存先カテゴリー**",
-                    color=0x5865F2)
-                view = Step4_ArchiveCategory(self.cog, self.original_interaction, self.support_roles, self.text_settings, category_id)
-                await interaction.response.edit_message(embed=embed, view=view)
-        except:
-            pass
-
 
 # ============================================================
 # ステップ4: ログ保存先カテゴリー
@@ -677,118 +649,6 @@ class Step4_ArchiveCategory(discord.ui.View):
         skip_btn.callback = self.on_skip
         self.add_item(skip_btn)
         
-        # ヘルプボタン
-        help_btn = discord.ui.Button(label="ヘルプ", style=discord.ButtonStyle.secondary, row=1)
-        help_btn.callback = self.show_help
-        self.add_item(help_btn)
-    
-    async def show_help(self, interaction: discord.Interaction):
-        """ヘルプ表示"""
-        embed = discord.Embed(title="ヘルプ: ログ保存先カテゴリー", color=0x00FF00)
-        embed.add_field(name="新規カテゴリー作成", value="「チケットログ」という新しいカテゴリーを自動作成します", inline=False)
-        embed.add_field(name="既存カテゴリー選択", value="選択したカテゴリーに終了したチケットを移動します", inline=False)
-        embed.add_field(name="スキップ", value="カテゴリー移動せず、その場で終了状態にします", inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-    async def on_select(self, interaction: discord.Interaction):
-        try:
-            if self.select.values[0] == "new":
-                # 新規カテゴリー作成
-                await interaction.response.defer(ephemeral=True, thinking=False)
-                category = await interaction.guild.create_category("チケットログ")
-                archive_category_id = category.id
-                await self.finalize(interaction, archive_category_id, use_followup=True)
-            else:
-                archive_category_id = int(self.select.values[0])
-                await self.finalize(interaction, archive_category_id, use_followup=False)
-        except:
-            pass
-    
-    async def on_skip(self, interaction: discord.Interaction):
-        try:
-            await self.finalize(interaction, None, use_followup=False)
-        except:
-            pass
-    
-    async def finalize(self, interaction, archive_category_id, use_followup=False):
-        """最終確認画面を表示"""
-        if not use_followup:
-            await interaction.response.defer(ephemeral=True, thinking=False)
-        try:
-            # 設定内容をまとめる
-            guild = self.original_interaction.guild
-            
-            # サポートロール
-            if self.support_roles:
-                role_names = [guild.get_role(r).name for r in self.support_roles if guild.get_role(r)]
-                support_text = ", ".join(role_names)
-            else:
-                support_text = "なし（管理者のみ）"
-            
-            # メッセージ関連
-            welcome_message = self.text_settings.get("welcome_message")
-            panel_title = self.text_settings.get("panel_title") or DEFAULT_PANEL_TITLE
-            panel_description = self.text_settings.get("panel_description") or DEFAULT_PANEL_DESCRIPTION
-            panel_button_label = self.text_settings.get("panel_button_label") or DEFAULT_PANEL_BUTTON_LABEL
-            start_title = self.text_settings.get("start_title") or DEFAULT_START_TITLE
-            start_description = self.text_settings.get("start_description") or DEFAULT_START_DESCRIPTION
-            
-            if welcome_message:
-                msg_preview = welcome_message[:50] + "..." if len(welcome_message) > 50 else welcome_message
-                message_text = f"カスタム: {msg_preview}"
-            else:
-                message_text = "デフォルト"
-            
-            # チケット作成先
-            ticket_cat = guild.get_channel(self.category_id)
-            ticket_cat_text = ticket_cat.name if ticket_cat else "不明"
-            
-            # ログ保存先
-            if archive_category_id:
-                archive_cat = guild.get_channel(archive_category_id)
-                archive_cat_text = archive_cat.name if archive_cat else "不明"
-            else:
-                archive_cat_text = "なし（その場で終了）"
-            
-            # 確認Embed
-            embed = discord.Embed(
-                title="設定内容の確認",
-                description="以下の内容でチケットシステムを作成します",
-                color=0x00FF00)
-            embed.add_field(name="サポートロール", value=support_text, inline=False)
-            embed.add_field(name="ウェルカムメッセージ", value=message_text, inline=False)
-            embed.add_field(
-                name="チケットパネル",
-                value=f"タイトル: {panel_title}\n説明: {panel_description[:80]}",
-                inline=False
-            )
-            embed.add_field(name="ボタンのラベル", value=panel_button_label, inline=False)
-            embed.add_field(
-                name="チャット開始メッセージ",
-                value=f"タイトル: {start_title}\n説明: {start_description[:80]}",
-                inline=False
-            )
-            embed.add_field(name="チケット作成先", value=ticket_cat_text, inline=False)
-            embed.add_field(name="ログ保存先", value=archive_cat_text, inline=False)
-            
-            system_data = {
-                'category_id': self.category_id,
-                'archive_category_id': archive_category_id,
-                'support_roles': self.support_roles,
-                'welcome_message': welcome_message or "サポートスタッフがすぐに対応します。",
-                'panel_title': panel_title,
-                'panel_description': panel_description,
-                'panel_button_label': panel_button_label,
-                'start_title': start_title,
-                'start_description': start_description
-            }
-            
-            view = TicketFinalConfirm(self.cog, self.original_interaction, system_data)
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-        except Exception as e:
-            logger.error(f"完了エラー: {e}")
-            await interaction.followup.send("❌ エラー", ephemeral=True)
-
 
 class TicketFinalConfirm(discord.ui.View):
     """最終確認"""
@@ -826,8 +686,8 @@ class TicketFinalConfirm(discord.ui.View):
             
             await interaction.followup.send("チケットシステムを作成しました", ephemeral=True)
         except Exception as e:
-            logger.error(f"作成エラー: {e}")
-            await interaction.followup.send("エラーが発生しました", ephemeral=True)
+            logger.error(f"TicketFinalConfirm.create_system エラー: {e}", exc_info=True)
+            await send_ticket_error(interaction, "チケットシステムの作成中にエラーが発生しました。")
     
     async def cancel(self, interaction: discord.Interaction):
         """キャンセル"""
@@ -863,7 +723,8 @@ class TicketButtonView(discord.ui.View):
             await interaction.response.send_message("チケットを作成しています...", ephemeral=True)
             asyncio.create_task(self.cog.create_ticket(interaction.user, interaction.channel, self.system_data))
         except Exception as e:
-            logger.error(f"チケット作成開始エラー: {e}")
+            logger.error(f"チケット作成開始エラー: {e}", exc_info=True)
+            await send_ticket_error(interaction)
 
 
 class TicketControlView(discord.ui.View):
@@ -893,8 +754,9 @@ class TicketControlView(discord.ui.View):
                 return
             await interaction.response.send_message("✅ 終了しました", ephemeral=True)
             asyncio.create_task(self.cog.close_ticket(self.ticket_channel, interaction.user, save_log=True))
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"close_ticket ボタンエラー: {e}", exc_info=True)
+            await send_ticket_error(interaction)
     
     @discord.ui.button(label="🔓 再開", style=discord.ButtonStyle.success, custom_id="reopen_ticket_button")
     async def reopen_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -908,8 +770,9 @@ class TicketControlView(discord.ui.View):
                 return
             await interaction.response.send_message("✅ 再開しました", ephemeral=True)
             asyncio.create_task(self.cog.reopen_ticket(self.ticket_channel, interaction.user))
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"reopen_ticket ボタンエラー: {e}", exc_info=True)
+            await send_ticket_error(interaction)
     
     @discord.ui.button(label="🗑️ 削除", style=discord.ButtonStyle.danger, custom_id="delete_ticket_button")
     async def delete_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -919,8 +782,9 @@ class TicketControlView(discord.ui.View):
                 return
             await interaction.response.send_message("✅ 削除します", ephemeral=True)
             asyncio.create_task(self.cog.close_ticket(self.ticket_channel, interaction.user, save_log=False))
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"delete_ticket ボタンエラー: {e}", exc_info=True)
+            await send_ticket_error(interaction)
 
 
 async def setup(bot):

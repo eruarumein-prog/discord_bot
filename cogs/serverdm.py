@@ -12,6 +12,16 @@ from database import Database
 logger = logging.getLogger('serverdm')
 logger.setLevel(logging.INFO)
 
+
+async def send_dm_error(interaction: discord.Interaction, message: str = "エラーが発生しました。もう一度お試しください。"):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as notify_err:
+        logger.error(f"DMエラー通知に失敗: {notify_err}")
+
 class ServerDM(commands.Cog):
     """サーバー内DM作成機能"""
     
@@ -27,51 +37,38 @@ class ServerDM(commands.Cog):
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
         """再起動後もViewが動作するようにViewを再構築"""
-        if interaction.type != discord.InteractionType.component:
-            return
-        
-        # カスタムIDからViewの種類を判定
-        if not interaction.data or 'custom_id' not in interaction.data:
-            return
-        
-        # 既にacknowledgeされている場合はスキップ
-        if interaction.response.is_done():
-            return
-        
-        custom_id = interaction.data['custom_id']
-        
-        # DM作成ボタンの場合
-        if custom_id.startswith('serverdm_create'):
-            view = ServerDMView(self)
-            # Viewのコールバックを手動で呼び出す
-            for item in view.children:
-                if isinstance(item, discord.ui.Button) and item.custom_id == custom_id:
-                    try:
+        try:
+            if interaction.type != discord.InteractionType.component:
+                return
+            
+            if not interaction.data or 'custom_id' not in interaction.data:
+                return
+            
+            custom_id = interaction.data['custom_id']
+            
+            # DM作成ボタンの場合
+            if custom_id.startswith('serverdm_create'):
+                view = ServerDMView(self)
+                for item in view.children:
+                    if isinstance(item, discord.ui.Button) and item.custom_id == custom_id:
                         await item.callback(interaction)
-                    except Exception as e:
-                        logger.error(f"DM作成ボタンコールバックエラー: {e}")
-                        if not interaction.response.is_done():
-                            await interaction.response.send_message("エラーが発生しました", ephemeral=True)
-                    return
-        
-        # DM削除ボタンの場合
-        elif custom_id.startswith('serverdm_delete_'):
-            channel_id_str = custom_id.replace('serverdm_delete_', '')
-            try:
+                        return
+            
+            # DM削除ボタンの場合
+            elif custom_id.startswith('serverdm_delete_'):
+                channel_id_str = custom_id.replace('serverdm_delete_', '')
                 channel_id = int(channel_id_str)
                 view = DMDeleteView(self, channel_id)
-                # Viewのコールバックを手動で呼び出す
                 for item in view.children:
                     if isinstance(item, discord.ui.Button):
-                        try:
-                            await item.callback(interaction)
-                        except Exception as e:
-                            logger.error(f"DM削除ボタンコールバックエラー: {e}")
-                            if not interaction.response.is_done():
-                                await interaction.response.send_message("エラーが発生しました", ephemeral=True)
+                        await item.callback(interaction)
                         return
-            except ValueError:
-                pass
+        except ValueError:
+            logger.warning(f"無効なserverdm_delete ID: {interaction.data.get('custom_id')}")
+            await send_dm_error(interaction)
+        except Exception as e:
+            logger.error(f"serverdm on_interaction エラー: {e}", exc_info=True)
+            await send_dm_error(interaction)
     
     @app_commands.command(name="serverdm", description="サーバー内DM作成操作盤を表示")
     @app_commands.describe(channel="操作盤を表示するチャンネル（省略可）")
@@ -112,7 +109,7 @@ class ServerDM(commands.Cog):
         except Exception as e:
             logger.error(f"操作盤表示エラー: {e}")
             logger.error(traceback.format_exc())
-            await interaction.response.send_message("エラーが発生しました", ephemeral=True)
+            await send_dm_error(interaction)
     
     async def create_dm_channel(self, creator: discord.Member, target_screen_id: str, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """DMチャンネルを作成"""
@@ -525,12 +522,8 @@ class ServerDMView(discord.ui.View):
             modal = ServerDMModal(self.cog, interaction.user)
             await interaction.response.send_modal(modal)
         except Exception as e:
-            logger.error(f"DM作成ボタンエラー: {e}")
-            if not interaction.response.is_done():
-                try:
-                    await interaction.response.send_message("エラーが発生しました", ephemeral=True)
-                except:
-                    await interaction.followup.send("エラーが発生しました", ephemeral=True)
+            logger.error(f"DM作成ボタンエラー: {e}", exc_info=True)
+            await send_dm_error(interaction)
 
 
 class DMDeleteView(discord.ui.View):
@@ -588,19 +581,8 @@ class DMDeleteView(discord.ui.View):
                     raise
                 
         except Exception as e:
-            logger.error(f"削除ボタンエラー: {e}")
-            logger.error(traceback.format_exc())
-            # 既にacknowledgeされている場合はfollowupを使用
-            if interaction.response.is_done():
-                try:
-                    await interaction.followup.send("エラーが発生しました", ephemeral=True)
-                except:
-                    pass  # チャンネルが削除されている場合は無視
-            else:
-                try:
-                    await interaction.response.send_message("エラーが発生しました", ephemeral=True)
-                except:
-                    pass
+            logger.error(f"削除ボタンエラー: {e}", exc_info=True)
+            await send_dm_error(interaction)
 
 
 class ServerDMModal(discord.ui.Modal, title="サーバー内DM作成"):
@@ -669,12 +651,8 @@ class ServerDMModal(discord.ui.Modal, title="サーバー内DM作成"):
                 )
                 
         except Exception as e:
-            logger.error(f"DM作成モーダルエラー: {e}")
-            logger.error(traceback.format_exc())
-            if not interaction.response.is_done():
-                await interaction.response.send_message("エラーが発生しました", ephemeral=True)
-            else:
-                await interaction.followup.send("エラーが発生しました", ephemeral=True)
+            logger.error(f"DM作成モーダルエラー: {e}", exc_info=True)
+            await send_dm_error(interaction)
 
 
 async def setup(bot: commands.Bot):

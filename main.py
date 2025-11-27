@@ -112,6 +112,8 @@ async def load_extensions():
     print('EmbedDisplayを読み込みました')
     await bot.load_extension('cogs.rolemanager')
     print('RoleManagerを読み込みました')
+    await bot.load_extension('cogs.invite_tracker')
+    print('InviteTrackerを読み込みました')
 
 async def main():
     async with bot:

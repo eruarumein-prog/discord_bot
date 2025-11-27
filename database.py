@@ -55,7 +55,8 @@ class Database:
                 notify_enabled INTEGER DEFAULT 0,
                 notify_channel_id INTEGER,
                 notify_role_id INTEGER,
-                control_category_id INTEGER
+                control_category_id INTEGER,
+                delete_delay_minutes INTEGER
             )
         ''')
         
@@ -99,6 +100,10 @@ class Database:
             cursor.execute("ALTER TABLE vc_systems ADD COLUMN control_category_id INTEGER")
         except:
             pass
+        try:
+            cursor.execute("ALTER TABLE vc_systems ADD COLUMN delete_delay_minutes INTEGER")
+        except:
+            pass
         
         try:
             cursor.execute("ALTER TABLE active_vcs ADD COLUMN view_allowed_users TEXT DEFAULT ''")
@@ -121,7 +126,9 @@ class Database:
                 is_locked INTEGER DEFAULT 0,
                 allowed_users TEXT DEFAULT '',
                 view_allowed_users TEXT DEFAULT '',
-                options TEXT DEFAULT ''
+                options TEXT DEFAULT '',
+                delete_ready_at TEXT,
+                delete_delay_minutes INTEGER
             )
         ''')
         
@@ -130,6 +137,14 @@ class Database:
             cursor.execute("ALTER TABLE active_vcs ADD COLUMN options TEXT DEFAULT ''")
         except:
             pass  # カラムが既に存在する場合
+        try:
+            cursor.execute("ALTER TABLE active_vcs ADD COLUMN delete_ready_at TEXT")
+        except:
+            pass
+        try:
+            cursor.execute("ALTER TABLE active_vcs ADD COLUMN delete_delay_minutes INTEGER")
+        except:
+            pass
         
         # 埋め込み表示テーブル
         cursor.execute('''
@@ -168,6 +183,25 @@ class Database:
             CREATE TABLE IF NOT EXISTS dm_categories (
                 guild_id INTEGER PRIMARY KEY,
                 category_id INTEGER NOT NULL
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS invite_watchers (
+                guild_id INTEGER NOT NULL,
+                inviter_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (guild_id, inviter_id)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS invite_counts (
+                guild_id INTEGER NOT NULL,
+                inviter_id INTEGER NOT NULL,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, inviter_id)
             )
         ''')
         
@@ -261,7 +295,7 @@ class Database:
                        user_limit: int, allowed_roles: List[int], vc_roles: List[int], hidden_roles: List[int],
                        location_mode: str, target_category_id: int, options: List[str], locked_name: str = None,
                        notify_enabled: bool = False, notify_channel_id: Optional[int] = None, notify_role_id: Optional[int] = None,
-                       control_category_id: Optional[int] = None):
+                       control_category_id: Optional[int] = None, delete_delay_minutes: Optional[int] = None):
         """VCシステムを保存"""
         with self.lock:
             conn = None
@@ -277,11 +311,11 @@ class Database:
                 cursor.execute('''
                     INSERT INTO vc_systems (guild_id, category_id, hub_vc_id, vc_type, user_limit, 
                                            allowed_roles, vc_roles, hidden_roles, location_mode, target_category_id, 
-                                           options, locked_name, notify_enabled, notify_channel_id, notify_role_id, control_category_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                           options, locked_name, notify_enabled, notify_channel_id, notify_role_id, control_category_id, delete_delay_minutes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (guild_id, category_id, hub_vc_id, vc_type, user_limit, 
                       allowed_roles_str, vc_roles_str, hidden_roles_str, location_mode, target_category_id, 
-                      options_str, locked_name, 1 if notify_enabled else 0, notify_channel_id, notify_role_id, control_category_id))
+                      options_str, locked_name, 1 if notify_enabled else 0, notify_channel_id, notify_role_id, control_category_id, delete_delay_minutes))
                 
                 conn.commit()
                 logger.info(f"✅ VCシステム保存完了 (Guild ID: {guild_id}, Hub VC ID: {hub_vc_id})")
@@ -336,7 +370,8 @@ class Database:
                     'notify_enabled': bool(row_dict.get('notify_enabled', 0)),
                     'notify_channel_id': row_dict.get('notify_channel_id'),
                     'notify_role_id': row_dict.get('notify_role_id'),
-                    'control_category_id': row_dict.get('control_category_id')
+                    'control_category_id': row_dict.get('control_category_id'),
+                    'delete_delay_minutes': row_dict.get('delete_delay_minutes')
                 })
             return systems
     
@@ -362,15 +397,19 @@ class Database:
                 view_allowed_str = ','.join(map(str, data.get('view_allowed_users', []))) if data.get('view_allowed_users') else ''
                 options_str = ','.join(data.get('options', [])) if data.get('options') else ''
                 
+                delete_ready_at = data.get('delete_ready_at')
+                delete_delay_minutes = data.get('delete_delay_minutes')
                 cursor.execute('''
                     INSERT OR REPLACE INTO active_vcs 
                     (vc_id, original_limit, original_name, bot_count, text_channel_id, control_channel_id,
-                     vc_type, category_id, owner_id, banned_users, is_locked, allowed_users, view_allowed_users, options)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     vc_type, category_id, owner_id, banned_users, is_locked, allowed_users, view_allowed_users, options,
+                     delete_ready_at, delete_delay_minutes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (vc_id, data.get('original_limit', 0), data.get('original_name', ''),
                       data.get('bot_count', 0), data.get('text_channel_id'), data.get('control_channel_id'),
                       data.get('vc_type', ''), data.get('category_id'), data.get('owner_id', 0),
-                      banned_str, 1 if data.get('is_locked', False) else 0, allowed_str, view_allowed_str, options_str))
+                      banned_str, 1 if data.get('is_locked', False) else 0, allowed_str, view_allowed_str, options_str,
+                      delete_ready_at, delete_delay_minutes))
                 
                 conn.commit()
                 logger.debug(f"✅ アクティブVC保存完了 (VC ID: {vc_id})")
@@ -419,7 +458,9 @@ class Database:
                     'is_locked': bool(row_dict.get('is_locked', 0)),
                     'allowed_users': allowed_users,
                     'view_allowed_users': view_allowed_users,
-                    'options': options
+                    'options': options,
+                    'delete_ready_at': row_dict.get('delete_ready_at'),
+                    'delete_delay_minutes': row_dict.get('delete_delay_minutes')
                 }
             return vcs
     
@@ -587,4 +628,68 @@ class Database:
             cursor.execute('DELETE FROM dm_categories WHERE guild_id = ?', (guild_id,))
             conn.commit()
             conn.close()
+
+    # ===== 招待監視関連 =====
+
+    def upsert_invite_watcher(self, guild_id: int, inviter_id: int, channel_id: int):
+        """招待監視設定を保存（同じユーザーは最新のチャンネルを保持）"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO invite_watchers (guild_id, inviter_id, channel_id, created_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(guild_id, inviter_id)
+                DO UPDATE SET channel_id = excluded.channel_id,
+                              created_at = CURRENT_TIMESTAMP
+            ''', (guild_id, inviter_id, channel_id))
+            conn.commit()
+            conn.close()
+
+    def get_all_invite_watchers(self):
+        """全ギルドの招待監視設定を取得"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT guild_id, inviter_id, channel_id FROM invite_watchers')
+            rows = cursor.fetchall()
+            conn.close()
+            return [{'guild_id': row[0], 'inviter_id': row[1], 'channel_id': row[2]} for row in rows]
+
+    def get_invite_watcher_channel(self, guild_id: int, inviter_id: int) -> Optional[int]:
+        """指定ユーザーの監視チャンネルを取得"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT channel_id FROM invite_watchers WHERE guild_id = ? AND inviter_id = ?', (guild_id, inviter_id))
+            row = cursor.fetchone()
+            conn.close()
+            return row[0] if row else None
+
+    def increment_invite_count(self, guild_id: int, inviter_id: int) -> int:
+        """招待数をインクリメントして最新値を返す"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO invite_counts (guild_id, inviter_id, total_count)
+                VALUES (?, ?, 1)
+                ON CONFLICT(guild_id, inviter_id)
+                DO UPDATE SET total_count = total_count + 1
+            ''', (guild_id, inviter_id))
+            cursor.execute('SELECT total_count FROM invite_counts WHERE guild_id = ? AND inviter_id = ?', (guild_id, inviter_id))
+            total = cursor.fetchone()[0]
+            conn.commit()
+            conn.close()
+            return total
+
+    def get_invite_count(self, guild_id: int, inviter_id: int) -> int:
+        """招待数を取得"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT total_count FROM invite_counts WHERE guild_id = ? AND inviter_id = ?', (guild_id, inviter_id))
+            row = cursor.fetchone()
+            conn.close()
+            return row[0] if row else 0
 

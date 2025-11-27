@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from typing import Optional, List
+import math
 import logging
 import traceback
 import sys
@@ -15,6 +16,18 @@ from database import Database
 # ロガー設定
 logger = logging.getLogger('rolemanager')
 logger.setLevel(logging.INFO)
+
+def summarize_role_mentions(guild: discord.Guild, role_ids: List[int], limit: int = 5) -> str:
+    names = []
+    for role_id in role_ids or []:
+        role = guild.get_role(role_id)
+        if role:
+            names.append(role.mention)
+    if not names:
+        return "未選択"
+    if len(names) > limit:
+        return ", ".join(names[:limit]) + f" 他{len(names) - limit}件"
+    return ", ".join(names)
 
 class RoleManager(commands.Cog):
     """ロール管理機能"""
@@ -36,12 +49,8 @@ class RoleManager(commands.Cog):
             target_channel = channel or interaction.channel
             
             # ロール選択Viewを表示
-            view = RoleSelectView(self, target_channel, interaction.guild)
-            embed = discord.Embed(
-                title="🎭 ロール管理操作盤 セットアップ",
-                description="**ステップ 1/2: 管理するロールを選択**\n\n操作盤に表示するロールを選択してください。",
-                color=0x5865F2
-            )
+            view = RoleSelectView(self, target_channel, interaction.guild, interaction.user)
+            embed = view.build_embed()
             
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         except Exception as e:
@@ -319,41 +328,156 @@ class RoleManager(commands.Cog):
 
 
 class RoleSelectView(discord.ui.View):
-    """ロール選択View"""
-    
-    def __init__(self, cog: RoleManager, target_channel: discord.TextChannel, guild: discord.Guild):
+    """管理するロールを段階的に選択するビュー"""
+    chunk_size = 25
+
+    def __init__(self, cog: RoleManager, target_channel: discord.TextChannel, guild: discord.Guild, requester: discord.abc.User):
         super().__init__(timeout=300)
         self.cog = cog
         self.target_channel = target_channel
         self.guild = guild
-        
-        # RoleSelectを追加
-        self.role_select = discord.ui.RoleSelect(
-            placeholder="管理するロールを選択",
-            min_values=1,
-            max_values=25
-        )
-        self.role_select.callback = self.on_role_select
-        self.add_item(self.role_select)
-    
-    async def on_role_select(self, interaction: discord.Interaction):
-        """ロール選択時の処理"""
-        try:
-            selected_roles = self.role_select.values
-            
-            # タイトルと内容を入力するモーダルを表示
-            modal = RolePanelTextModal(self.cog, self.target_channel, [role.id for role in selected_roles], self.guild)
-            await interaction.response.send_modal(modal)
-        except Exception as e:
-            logger.error(f"ロール選択エラー: {e}")
-            logger.error(traceback.format_exc())
-            if not interaction.response.is_done():
-                await interaction.response.edit_message(
-                    content="エラーが発生しました",
-                    embed=None,
-                    view=None
-                )
+        self.requester_id = requester.id
+        self.available_roles = self._filter_roles(guild)
+        self.selected_role_ids: List[int] = []
+        self.current_page = 0
+        self.role_select: Optional[discord.ui.Select] = None
+        self.total_pages = max(1, math.ceil(len(self.available_roles) / self.chunk_size)) if self.available_roles else 1
 
+        self._build_role_dropdown()
+        self._build_controls()
+
+    def _filter_roles(self, guild: discord.Guild) -> List[discord.Role]:
+        me = guild.me
+        filtered = []
+        for role in guild.roles:
+            if role == guild.default_role:
+                continue
+            if me and role >= me.top_role:
+                continue
+            filtered.append(role)
+        return filtered
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.requester_id
+
+    def build_embed(self) -> discord.Embed:
+        description = (
+            "**ステップ 1/2: 管理するロールを選択**\n\n"
+            "ロールは複数追加できます。ページを切り替えながら必要なロールをすべて選択してください。"
+        )
+        embed = discord.Embed(title="🎭 ロール管理操作盤 セットアップ", description=description, color=0x5865F2)
+        summary = summarize_role_mentions(self.guild, self.selected_role_ids, limit=8)
+        embed.add_field(name="現在の選択", value=summary, inline=False)
+        if self.available_roles:
+            embed.set_footer(text=f"ページ {self.current_page + 1}/{self.total_pages}")
+        else:
+            embed.set_footer(text="選択できるロールがありません。")
+        return embed
+
+    def _get_current_chunk(self) -> List[discord.Role]:
+        if not self.available_roles:
+            return []
+        start = self.current_page * self.chunk_size
+        end = start + self.chunk_size
+        return self.available_roles[start:end]
+
+    def _build_role_dropdown(self):
+        if self.role_select:
+            self.remove_item(self.role_select)
+            self.role_select = None
+
+        chunk = self._get_current_chunk()
+        if not chunk:
+            return
+
+        options = [
+            discord.SelectOption(label=role.name[:95], value=str(role.id))
+            for role in chunk
+        ]
+        placeholder = f"管理するロールを選択 ({self.current_page + 1}/{self.total_pages})"
+        select = discord.ui.Select(
+            placeholder=placeholder,
+            options=options,
+            min_values=0,
+            max_values=len(options),
+            row=0
+        )
+        select.callback = self._on_select
+        self.role_select = select
+        self.add_item(select)
+
+    def _build_controls(self):
+        self.prev_button = discord.ui.Button(label="前の25件", style=discord.ButtonStyle.secondary, disabled=self.total_pages <= 1, row=1)
+        self.prev_button.callback = self._go_prev
+        self.add_item(self.prev_button)
+
+        self.next_button = discord.ui.Button(label="次の25件", style=discord.ButtonStyle.secondary, disabled=self.total_pages <= 1, row=1)
+        self.next_button.callback = self._go_next
+        self.add_item(self.next_button)
+
+        self.confirm_button = discord.ui.Button(label="選択を確定", style=discord.ButtonStyle.success, row=2)
+        self.confirm_button.callback = self._confirm_selection
+        self.add_item(self.confirm_button)
+
+        clear_button = discord.ui.Button(label="選択をクリア", style=discord.ButtonStyle.danger, row=2)
+        clear_button.callback = self._clear_selection
+        self.add_item(clear_button)
+
+        cancel_button = discord.ui.Button(label="キャンセル", style=discord.ButtonStyle.secondary, row=3)
+        cancel_button.callback = self._cancel
+        self.add_item(cancel_button)
+
+        if not self.available_roles:
+            self.confirm_button.disabled = True
+            self.prev_button.disabled = True
+            self.next_button.disabled = True
+
+    async def _update_message(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        updated = False
+        for value in getattr(self.role_select, 'values', []):
+            role_id = int(value)
+            if role_id not in self.selected_role_ids:
+                self.selected_role_ids.append(role_id)
+                updated = True
+        if updated:
+            await self._update_message(interaction)
+        else:
+            await interaction.response.defer()
+
+    async def _go_prev(self, interaction: discord.Interaction):
+        if self.total_pages <= 1:
+            await interaction.response.defer()
+            return
+        self.current_page = (self.current_page - 1) % self.total_pages
+        self._build_role_dropdown()
+        await self._update_message(interaction)
+
+    async def _go_next(self, interaction: discord.Interaction):
+        if self.total_pages <= 1:
+            await interaction.response.defer()
+            return
+        self.current_page = (self.current_page + 1) % self.total_pages
+        self._build_role_dropdown()
+        await self._update_message(interaction)
+
+    async def _clear_selection(self, interaction: discord.Interaction):
+        self.selected_role_ids.clear()
+        await self._update_message(interaction)
+
+    async def _confirm_selection(self, interaction: discord.Interaction):
+        if not self.selected_role_ids:
+            await interaction.response.send_message("少なくとも1つのロールを選択してください。", ephemeral=True)
+            return
+        modal = RolePanelTextModal(self.cog, self.target_channel, list(self.selected_role_ids), self.guild)
+        await interaction.response.send_modal(modal)
+
+    async def _cancel(self, interaction: discord.Interaction):
+        embed = discord.Embed(title="セットアップをキャンセルしました", color=0xED4245)
+        await interaction.response.edit_message(embed=embed, view=None)
+        self.stop()
 
 class RolePanelTextModal(discord.ui.Modal):
     """ロール管理操作盤のタイトルと内容入力モーダル"""
