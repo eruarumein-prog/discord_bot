@@ -404,7 +404,7 @@ class Database:
                     (vc_id, original_limit, original_name, bot_count, text_channel_id, control_channel_id,
                      vc_type, category_id, owner_id, banned_users, is_locked, allowed_users, view_allowed_users, options,
                      delete_ready_at, delete_delay_minutes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (vc_id, data.get('original_limit', 0), data.get('original_name', ''),
                       data.get('bot_count', 0), data.get('text_channel_id'), data.get('control_channel_id'),
                       data.get('vc_type', ''), data.get('category_id'), data.get('owner_id', 0),
