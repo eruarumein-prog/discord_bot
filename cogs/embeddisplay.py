@@ -164,21 +164,14 @@ class EmbedDisplay(commands.Cog):
                     # メッセージが存在するか確認
                     try:
                         message = await channel.fetch_message(message_id)
-                        # メッセージが存在する場合はactive_embedsに追加
+                        # メッセージが存在する場合はactive_embedsに追加（既存の埋め込みを再利用）
                         self.active_embeds[channel_id] = message_id
                         restored_count += 1
                         logger.info(f"埋め込み表示を復元しました (Channel: {channel_id}, Message: {message_id})")
                     except discord.NotFound:
-                        # メッセージが削除されている場合は再作成
-                        embed = discord.Embed(
-                            description=content,
-                            color=0x5865F2
-                        )
-                        new_message = await channel.send(embed=embed)
-                        self.active_embeds[channel_id] = new_message.id
-                        self.db.save_embed_display(channel_id, new_message.id, content)
-                        restored_count += 1
-                        logger.info(f"埋め込み表示を再作成しました (Channel: {channel_id}, Message: {new_message.id})")
+                        # メッセージが削除されている場合はデータベースから削除（再作成しない）
+                        self.db.delete_embed_display(channel_id)
+                        logger.info(f"埋め込み表示が削除されていたため、データベースから削除しました (Channel: {channel_id})")
                 except Exception as e:
                     logger.error(f"埋め込み表示復元エラー (Channel: {channel_id}): {e}")
                     logger.error(traceback.format_exc())

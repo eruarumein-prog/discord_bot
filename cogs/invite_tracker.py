@@ -244,43 +244,35 @@ class InviteTracker(commands.Cog):
             inviter_url = f"https://discord.com/users/{target_id}"
             member_url = f"https://discord.com/users/{joined_member.id}"
 
+            # 1つの埋め込みに全情報をまとめる
+            description_parts = [
+                f"**参加ユーザー:** [{joined_member.name}]({member_url})",
+                f"スクリーンID: **{self._screen_name(joined_member)}**",
+                f"ID: `{joined_member.id}`",
+                "",
+                f"**招待者:** [{inviter_member.name}]({inviter_url})",
+                f"スクリーンID: **{self._screen_name(inviter_member)}**",
+                f"ID: `{inviter_member.id}`",
+                "",
+                f"**累計招待数:** {total_count} 人"
+            ]
+
+            if invite and invite.url:
+                description_parts.append(f"**使用された招待リンク:** [{invite.code}]({invite.url})")
+
+            if account_age < timedelta(days=30):
+                description_parts.append("")
+                description_parts.append("⚠ **アカウント警告:** このユーザーはアカウント作成から30日未満です。")
+
             embed = discord.Embed(
                 title="📥 新規参加を検知しました",
+                description="\n".join(description_parts),
                 color=0x2B2D31,
                 timestamp=utcnow()
             )
             embed.set_thumbnail(url=joined_member.display_avatar.url)
-            embed.add_field(
-                name="参加ユーザー",
-                value=(
-                    f"[{joined_member.name}]({member_url})\n"
-                    f"スクリーンID: **{self._screen_name(joined_member)}**\n"
-                    f"ID: `{joined_member.id}`"
-                ),
-                inline=False
-            )
-            embed.add_field(
-                name="招待者",
-                value=(
-                    f"[{inviter_member.name}]({inviter_url})\n"
-                    f"スクリーンID: **{self._screen_name(inviter_member)}**\n"
-                    f"ID: `{inviter_member.id}`"
-                ),
-                inline=False
-            )
 
-            if invite and invite.url:
-                embed.add_field(name="使用された招待リンク", value=f"[{invite.code}]({invite.url})", inline=False)
-
-            embed.add_field(name="累計招待数", value=f"{total_count} 人", inline=True)
-
-            if account_age < timedelta(days=30):
-                embed.add_field(
-                    name="⚠ アカウント警告",
-                    value="このユーザーはアカウント作成から30日未満です。",
-                    inline=False
-                )
-
+            # 全員に見えるように通常メッセージとして送信（ephemeral=Falseがデフォルト）
             await channel.send(embed=embed)
         except Exception as e:
             logger.error(f"[{joined_member.guild.name}] _handle_tracked_invite エラー: {e}", exc_info=True)

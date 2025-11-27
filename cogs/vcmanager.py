@@ -1219,12 +1219,20 @@ class VCManager(commands.Cog):
         
         if control_category_new:
             try:
-                category = await guild.create_category("VC操作パネル")
+                category = await retry_on_rate_limit(
+                    guild.create_category("VC操作パネル")
+                )
                 control_category_id = category.id
                 logger.info(f"🆕 操作パネル用カテゴリーを作成: {category.name} (ID: {category.id})")
+            except discord.Forbidden:
+                logger.error("操作パネルカテゴリー作成エラー: 権限が不足しています", exc_info=True)
+                raise Exception("操作パネル用カテゴリーの作成に必要な権限がありません。チャンネル管理権限を確認してください。")
+            except discord.HTTPException as e:
+                logger.error(f"操作パネルカテゴリー作成エラー (HTTP): {e}", exc_info=True)
+                raise Exception(f"操作パネル用カテゴリーの作成に失敗しました: {str(e)[:100]}")
             except Exception as e:
-                logger.error(f"操作パネルカテゴリー作成エラー: {e}")
-                control_category_id = None
+                logger.error(f"操作パネルカテゴリー作成エラー: {e}", exc_info=True)
+                raise Exception(f"操作パネル用カテゴリーの作成中にエラーが発生しました: {str(e)[:100]}")
         self.vc_systems[guild.id][storage_key] = {
             'hub_vc_id': hub_vc.id,
             'vc_type': vc_type,
@@ -5040,9 +5048,9 @@ class VCFinalConfirm(discord.ui.View):
     
     @discord.ui.button(label="作成", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=False)
         try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True, thinking=False)
             await self._create_system(interaction)
             success_embed = discord.Embed(
                 title="VC管理システムを作成しました",
@@ -5051,9 +5059,15 @@ class VCFinalConfirm(discord.ui.View):
             )
             await self.original_interaction.edit_original_response(embed=success_embed, view=None)
             await interaction.followup.send("VC管理システムを作成しました", ephemeral=True)
+        except discord.Forbidden:
+            logger.error("VC管理システム作成エラー: 権限が不足しています", exc_info=True)
+            await send_interaction_error(interaction, "❌ ボットに必要な権限がありません。チャンネル管理権限を確認してください。")
+        except discord.HTTPException as e:
+            logger.error(f"VC管理システム作成エラー (HTTP): {e}", exc_info=True)
+            await send_interaction_error(interaction, f"❌ Discord APIエラーが発生しました: {str(e)[:100]}")
         except Exception as e:
-            logger.error(f"完了エラー: {e}")
-            await interaction.followup.send("エラーが発生しました", ephemeral=True)
+            logger.error(f"VC管理システム作成エラー: {e}", exc_info=True)
+            await send_interaction_error(interaction, "❌ VC管理システムの作成中にエラーが発生しました。ログを確認してください。")
     
     @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -5481,14 +5495,6 @@ class VCStep9_ControlCategory(discord.ui.View):
         self.next_button.callback = self._go_next  # type: ignore[assignment]
         self.add_item(self.next_button)
 
-        back_button = discord.ui.Button(
-            label="戻る（VC作成先カテゴリーに戻る）",
-            style=discord.ButtonStyle.secondary,
-            row=2,
-        )
-        back_button.callback = self._go_back_to_step8  # type: ignore[assignment]
-        self.add_item(back_button)
-
     def _get_current_chunk(self) -> List[discord.CategoryChannel]:
         if not self.categories:
             return []
@@ -5591,32 +5597,32 @@ class VCStep9_ControlCategory(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=view)
 
     async def on_select(self, interaction: discord.Interaction):
-        if not self.category_select or not self.category_select.values:
-            await interaction.response.defer()
-            return
-
-        value = self.category_select.values[0]
-        if value == "create":
-            # 新しいカテゴリーを作成するパターン
-            await self.show_summary(interaction, None, control_category_new=True)
-            return
-
         try:
-            category_id = int(value)
-        except ValueError:
-            await interaction.response.send_message(
-                "カテゴリーを正しく選択してください。", ephemeral=True
-            )
-            return
+            if not self.category_select or not self.category_select.values:
+                await interaction.response.defer()
+                return
 
-        category = interaction.guild.get_channel(category_id)
-        if not isinstance(category, discord.CategoryChannel):
-            await interaction.response.send_message(
-                "カテゴリーを選択してください", ephemeral=True
-            )
-            return
+            value = self.category_select.values[0]
+            if value == "create":
+                # 新しいカテゴリーを作成するパターン
+                await self.show_summary(interaction, None, control_category_new=True)
+                return
 
-        await self.show_summary(interaction, category.id, control_category_new=False)
+            try:
+                category_id = int(value)
+            except ValueError:
+                await send_interaction_error(interaction, "カテゴリーを正しく選択してください。")
+                return
+
+            category = interaction.guild.get_channel(category_id)
+            if not isinstance(category, discord.CategoryChannel):
+                await send_interaction_error(interaction, "カテゴリーを選択してください")
+                return
+
+            await self.show_summary(interaction, category.id, control_category_new=False)
+        except Exception as e:
+            logger.error(f"VCStep9_ControlCategory.on_select エラー: {e}", exc_info=True)
+            await send_interaction_error(interaction, "操作パネルカテゴリー選択中にエラーが発生しました。")
 
     async def show_summary(
         self,
@@ -5624,44 +5630,51 @@ class VCStep9_ControlCategory(discord.ui.View):
         control_category_id: Optional[int],
         control_category_new: bool,
     ):
-        guild = self.original_interaction.guild
-        embed = build_vc_summary_embed(
-            guild,
-            self.vc_type,
-            self.user_limit,
-            self.hub_role_ids,
-            self.vc_role_ids,
-            self.hidden_role_ids,
-            self.selected_options,
-            self.locked_name,
-            self.delete_delay_minutes,
-            self.location_mode,
-            self.target_category_id,
-            control_category_id,
-            control_category_new=control_category_new,
-        )
-        view = VCFinalConfirm(
-            self.cog,
-            self.original_interaction,
-            self.vc_type,
-            self.user_limit,
-            self.hub_role_ids,
-            self.vc_role_ids,
-            self.hidden_role_ids,
-            self.selected_options,
-            self.locked_name,
-            self.delete_delay_minutes,
-            self.location_mode,
-            self.target_category_id,
-            control_category_id,
-            self.notify_enabled,
-            self.notify_channel_id,
-            self.notify_category_id,
-            self.notify_role_id,
-            control_category_new=control_category_new,
-            notify_category_new=self.notify_category_new,
-        )
-        await interaction.response.edit_message(embed=embed, view=view)
+        try:
+            guild = self.original_interaction.guild
+            embed = build_vc_summary_embed(
+                guild,
+                self.vc_type,
+                self.user_limit,
+                self.hub_role_ids,
+                self.vc_role_ids,
+                self.hidden_role_ids,
+                self.selected_options,
+                self.locked_name,
+                self.delete_delay_minutes,
+                self.location_mode,
+                self.target_category_id,
+                control_category_id,
+                control_category_new=control_category_new,
+            )
+            view = VCFinalConfirm(
+                self.cog,
+                self.original_interaction,
+                self.vc_type,
+                self.user_limit,
+                self.hub_role_ids,
+                self.vc_role_ids,
+                self.hidden_role_ids,
+                self.selected_options,
+                self.locked_name,
+                self.delete_delay_minutes,
+                self.location_mode,
+                self.target_category_id,
+                control_category_id,
+                self.notify_enabled,
+                self.notify_channel_id,
+                self.notify_category_id,
+                self.notify_role_id,
+                control_category_new=control_category_new,
+                notify_category_new=self.notify_category_new,
+            )
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            else:
+                await interaction.response.edit_message(embed=embed, view=view)
+        except Exception as e:
+            logger.error(f"VCStep9_ControlCategory.show_summary エラー: {e}", exc_info=True)
+            await send_interaction_error(interaction, "最終確認画面の表示中にエラーが発生しました。")
 
 
 async def setup(bot):
