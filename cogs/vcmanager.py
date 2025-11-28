@@ -5254,6 +5254,7 @@ class VCStep8_Category(discord.ui.View):
         self.notify_channel_id = notify_channel_id
         self.notify_category_id = notify_category_id
         self.notify_role_id = notify_role_id
+        self.notify_category_new = notify_category_new
         self.categories = list(original_interaction.guild.categories)
         self.current_page = 0
         self.category_select: Optional[discord.ui.Select] = None
