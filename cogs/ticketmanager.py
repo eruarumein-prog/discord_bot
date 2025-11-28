@@ -6,6 +6,7 @@ import sqlite3
 import json
 import asyncio
 import traceback
+import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,33 @@ class TicketManager(commands.Cog):
         self.bot = bot
         self.ticket_systems = {}
         self.active_tickets = {}
-        self.db_path = "data/tickets.db"
+        # 環境変数からデータベースパスを取得（優先）
+        db_path = os.getenv('TICKET_DATABASE_PATH') or os.getenv('TICKET_DB_PATH')
+        if db_path is None:
+            # データディレクトリを作成
+            data_dir = os.getenv('DATA_DIR', 'data')
+            os.makedirs(data_dir, exist_ok=True)
+            db_path = os.path.join(data_dir, 'tickets.db')
+        
+        # 既存データベースの移行処理
+        # 古い場所（data/tickets.db）にデータベースがある場合、新しい場所にコピー
+        old_db_path = "data/tickets.db"  # 古いデフォルトパス
+        if os.path.exists(old_db_path) and not os.path.exists(db_path):
+            try:
+                import shutil
+                db_dir = os.path.dirname(db_path)
+                if db_dir and not os.path.exists(db_dir):
+                    os.makedirs(db_dir, exist_ok=True)
+                shutil.copy2(old_db_path, db_path)
+                logger.info(f"既存チケットデータベースを移行しました: {old_db_path} -> {db_path}")
+            except Exception as e:
+                logger.warning(f"チケットデータベース移行に失敗しました（新規作成します）: {e}")
+        
+        # ディレクトリが存在しない場合は作成
+        db_dir = os.path.dirname(db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+        self.db_path = db_path
         self.editing_channels = set()
         self.init_database()
         self.bot.loop.create_task(self.load_and_restore_async())

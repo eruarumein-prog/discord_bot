@@ -11,9 +11,40 @@ logger.setLevel(logging.INFO)
 class Database:
     """SQLiteデータベース管理クラス"""
     
-    def __init__(self, db_path: str = "vc_data.db"):
+    def __init__(self, db_path: str = None):
+        # 環境変数からデータベースパスを取得（優先）
+        if db_path is None:
+            db_path = os.getenv('DATABASE_PATH') or os.getenv('DB_PATH')
+        
+        # デフォルトパス（環境変数がない場合）
+        if db_path is None:
+            # データディレクトリを作成
+            data_dir = os.getenv('DATA_DIR', 'data')
+            os.makedirs(data_dir, exist_ok=True)
+            db_path = os.path.join(data_dir, 'vc_data.db')
+        
+        # 既存データベースの移行処理
+        # 古い場所（プロジェクトルート）にデータベースがある場合、新しい場所にコピー
+        old_db_path = "vc_data.db"  # 古いデフォルトパス
+        if os.path.exists(old_db_path) and not os.path.exists(db_path):
+            try:
+                import shutil
+                db_dir = os.path.dirname(db_path)
+                if db_dir and not os.path.exists(db_dir):
+                    os.makedirs(db_dir, exist_ok=True)
+                shutil.copy2(old_db_path, db_path)
+                logger.info(f"既存データベースを移行しました: {old_db_path} -> {db_path}")
+            except Exception as e:
+                logger.warning(f"データベース移行に失敗しました（新規作成します）: {e}")
+        
+        # ディレクトリが存在しない場合は作成
+        db_dir = os.path.dirname(db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+        
         self.db_path = db_path
         self.lock = threading.Lock()
+        logger.info(f"データベースパス: {self.db_path}")
         self.init_database()
     
     def get_connection(self):
