@@ -5217,6 +5217,7 @@ class VCStep7_Location(discord.ui.View):
                 self.hidden_role_ids,
                 self.selected_options,
                 self.locked_name,
+                self.delete_delay_minutes,
                 location_mode,
                 target_category_id,
                 None,  # control_category_id
@@ -5416,6 +5417,7 @@ class VCStep8_Category(discord.ui.View):
                 self.hidden_role_ids,
                 self.selected_options,
                 self.locked_name,
+                self.delete_delay_minutes,
                 location_mode,
                 target_category_id,
                 None,
