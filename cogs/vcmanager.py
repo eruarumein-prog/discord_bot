@@ -145,13 +145,20 @@ class VCManager(commands.Cog):
                 'notify_channel_id': system.get('notify_channel_id'),
                 'notify_role_id': system.get('notify_role_id'),
                 'control_category_id': system.get('control_category_id'),
-                'delete_delay_minutes': system.get('delete_delay_minutes'),
+                'delete_delay_minutes': int(system.get('delete_delay_minutes')) if system.get('delete_delay_minutes') is not None else None,
                 'name_counter': {}
             }
         
         # アクティブVCを復元
         active_vcs = self.db.get_active_vcs()
         for vc_id, data in active_vcs.items():
+            # delete_delay_minutesが文字列の場合は整数に変換
+            if 'delete_delay_minutes' in data and data['delete_delay_minutes'] is not None:
+                try:
+                    data['delete_delay_minutes'] = int(data['delete_delay_minutes'])
+                except (ValueError, TypeError):
+                    logger.warning(f"無効なdelete_delay_minutes値 (VC ID: {vc_id}): {data['delete_delay_minutes']}")
+                    data['delete_delay_minutes'] = None
             # VCがまだ存在するか確認
             found = False
             for guild in self.bot.guilds:
@@ -312,6 +319,12 @@ class VCManager(commands.Cog):
         if not vc_data:
             return True
         delay_minutes = vc_data.get('delete_delay_minutes')
+        # 文字列の場合は整数に変換
+        if delay_minutes is not None:
+            try:
+                delay_minutes = int(delay_minutes)
+            except (ValueError, TypeError):
+                delay_minutes = None
         if not delay_minutes:
             return True
         ready_at = self._parse_delete_ready_at(vc_data.get('delete_ready_at'))
@@ -577,6 +590,13 @@ class VCManager(commands.Cog):
         }
 
         delete_delay_minutes = system_data.get('delete_delay_minutes')
+        # 文字列の場合は整数に変換
+        if delete_delay_minutes is not None:
+            try:
+                delete_delay_minutes = int(delete_delay_minutes)
+            except (ValueError, TypeError):
+                logger.warning(f"無効なdelete_delay_minutes値: {delete_delay_minutes}")
+                delete_delay_minutes = None
         if delete_delay_minutes:
             ready_at = datetime.utcnow() + timedelta(minutes=delete_delay_minutes)
             self.active_vcs[new_vc.id]['delete_delay_minutes'] = delete_delay_minutes
@@ -1112,6 +1132,9 @@ class VCManager(commands.Cog):
     
     async def _create_vc_system_impl(self, guild: discord.Guild, vc_type: str, user_limit: int, hub_role_ids: List[int], vc_role_ids: List[int], hidden_role_ids: List[int], location_mode: str, target_category_id: Optional[int], source_channel, options: List[str], locked_name: Optional[str] = None, control_category_id: Optional[int] = None, notify_enabled: bool = False, notify_channel_id: Optional[int] = None, notify_category_id: Optional[int] = None, notify_role_id: Optional[int] = None, notify_category_new: bool = False, control_category_new: bool = False, delete_delay_minutes: Optional[int] = None):
         """VC管理システムを作成（内部実装）"""
+        # location_modeがNoneの場合はデフォルト値を設定
+        if not location_mode:
+            location_mode = VCLocationMode.AUTO_CATEGORY
         # source_channelがリストの場合は最初の要素を取得（エラー回避）
         if isinstance(source_channel, list):
             source_channel = source_channel[0] if source_channel else None

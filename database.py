@@ -445,6 +445,14 @@ class Database:
                 view_allowed_users = [int(u) for u in row_dict.get('view_allowed_users', '').split(',') if u]
                 options = row_dict.get('options', '').split(',') if row_dict.get('options') else []
                 
+                # delete_delay_minutesが文字列の場合は整数に変換
+                delete_delay_minutes = row_dict.get('delete_delay_minutes')
+                if delete_delay_minutes is not None:
+                    try:
+                        delete_delay_minutes = int(delete_delay_minutes)
+                    except (ValueError, TypeError):
+                        delete_delay_minutes = None
+                
                 vcs[row_dict['vc_id']] = {
                     'original_limit': row_dict.get('original_limit', 0),
                     'original_name': row_dict.get('original_name', ''),
@@ -460,7 +468,7 @@ class Database:
                     'view_allowed_users': view_allowed_users,
                     'options': options,
                     'delete_ready_at': row_dict.get('delete_ready_at'),
-                    'delete_delay_minutes': row_dict.get('delete_delay_minutes')
+                    'delete_delay_minutes': delete_delay_minutes
                 }
             return vcs
     
