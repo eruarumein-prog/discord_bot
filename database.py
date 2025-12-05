@@ -73,7 +73,7 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
                 category_id INTEGER,
-                hub_vc_id INTEGER NOT NULL,
+                hub_vc_id INTEGER NOT NULL UNIQUE,
                 vc_type TEXT NOT NULL,
                 user_limit INTEGER DEFAULT 0,
                 allowed_roles TEXT DEFAULT '',
@@ -140,6 +140,13 @@ class Database:
             cursor.execute("ALTER TABLE active_vcs ADD COLUMN view_allowed_users TEXT DEFAULT ''")
         except:
             pass
+        
+        # 既存テーブルにhub_vc_idのUNIQUE制約を追加（マイグレーション）
+        # SQLiteでは直接ADD CONSTRAINTができないため、UNIQUEインデックスで代用
+        try:
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_vc_systems_hub_vc_id ON vc_systems(hub_vc_id)")
+        except:
+            pass  # 既に存在する場合
         
         # アクティブなVCテーブル
         cursor.execute('''
@@ -340,7 +347,7 @@ class Database:
                 options_str = ','.join(options) if options else ''
                 
                 cursor.execute('''
-                    INSERT INTO vc_systems (guild_id, category_id, hub_vc_id, vc_type, user_limit, 
+                    INSERT OR REPLACE INTO vc_systems (guild_id, category_id, hub_vc_id, vc_type, user_limit, 
                                            allowed_roles, vc_roles, hidden_roles, location_mode, target_category_id, 
                                            options, locked_name, notify_enabled, notify_channel_id, notify_role_id, control_category_id, delete_delay_minutes)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

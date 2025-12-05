@@ -110,9 +110,14 @@ class VCManager(commands.Cog):
         
         # VCシステムを復元
         systems = self.db.get_vc_systems()
+        restored_count = 0
+        skipped_count = 0
+        
         for system in systems:
             guild = self.bot.get_guild(system['guild_id'])
             if not guild:
+                skipped_count += 1
+                logger.debug(f"VCシステム復元スキップ: ギルドが見つかりません (Guild ID: {system['guild_id']}, Hub VC ID: {system['hub_vc_id']})")
                 continue
             
             # ハブVCがまだ存在するか確認
@@ -120,16 +125,23 @@ class VCManager(commands.Cog):
             if not hub_vc:
                 # 存在しない場合はDBから削除
                 self.db.delete_vc_system_by_hub(system['hub_vc_id'])
+                skipped_count += 1
+                logger.info(f"VCシステム削除: ハブVCが存在しません (Hub VC ID: {system['hub_vc_id']})")
                 continue
             
             # メモリに復元
             guild_id = system['guild_id']
-            category_id = system['category_id']
             
             if guild_id not in self.vc_systems:
                 self.vc_systems[guild_id] = {}
             
-            storage_key = category_id if category_id else system['hub_vc_id']
+            # storage_keyは常にhub_vc_idを使用（複数のVCシステムを区別するため）
+            storage_key = system['hub_vc_id']
+            
+            # 重複チェック（既に同じhub_vc_idのシステムが存在する場合）
+            if storage_key in self.vc_systems[guild_id]:
+                logger.warning(f"VCシステム重複検出: 既に同じハブVCのシステムが存在します (Hub VC ID: {storage_key})。上書きします。")
+            
             self.vc_systems[guild_id][storage_key] = {
                 'hub_vc_id': system['hub_vc_id'],
                 'vc_type': system['vc_type'],
@@ -148,6 +160,8 @@ class VCManager(commands.Cog):
                 'delete_delay_minutes': int(system.get('delete_delay_minutes')) if system.get('delete_delay_minutes') is not None else None,
                 'name_counter': {}
             }
+            restored_count += 1
+            logger.debug(f"VCシステム復元: ギルド={guild.name} (ID: {guild_id}), ハブVC={hub_vc.name} (ID: {storage_key}), タイプ={system['vc_type']}")
         
         # アクティブVCを復元
         active_vcs = self.db.get_active_vcs()
@@ -173,8 +187,10 @@ class VCManager(commands.Cog):
                 # 存在しない場合はDBから削除
                 self.db.delete_active_vc(vc_id)
         
-        print(f"VCシステムを復元しました: {len(self.vc_systems)} ギルド")
-        print(f"アクティブVCを復元しました: {len(self.active_vcs)} チャンネル")
+        # 復元されたVCシステムの総数をカウント
+        total_systems = sum(len(systems) for systems in self.vc_systems.values())
+        logger.info(f"✅ VCシステムを復元しました: {len(self.vc_systems)} ギルド、合計 {total_systems} システム (復元: {restored_count}, スキップ: {skipped_count})")
+        logger.info(f"✅ アクティブVCを復元しました: {len(self.active_vcs)} チャンネル")
 
     
     @app_commands.command(name="vc", description="VC管理システムを作成します")
@@ -223,13 +239,16 @@ class VCManager(commands.Cog):
         """VC参加時の処理"""
         guild_id = member.guild.id
         
-        # ハブVCへの参加をチェック
+        # ハブVCへの参加をチェック（複数のVCシステムに対応）
         if guild_id in self.vc_systems:
-            for category_id, system_data in self.vc_systems[guild_id].items():
+            for storage_key, system_data in self.vc_systems[guild_id].items():
                 if channel.id == system_data['hub_vc_id']:
                     # 新しいVCを作成してユーザーを移動
                     hub_vc = member.guild.get_channel(system_data['hub_vc_id'])
-                    await self.create_and_move_user(member, hub_vc, system_data)
+                    if hub_vc:
+                        await self.create_and_move_user(member, hub_vc, system_data)
+                    else:
+                        logger.warning(f"ハブVCが見つかりません (ID: {system_data['hub_vc_id']})")
                     return
         
         # 既存のVCへのBOT参加をチェック
@@ -1007,31 +1026,91 @@ class VCManager(commands.Cog):
         if channel.id not in self.active_vcs:
             return
         
-        vc_data = self.active_vcs[channel.id]
-        
-        # 人数指定タイプのみ処理
-        if vc_data.get('vc_type') == VCType.LIMIT:
-            vc_data['bot_count'] += 1
-            original_limit = vc_data['original_limit']
-            new_limit = original_limit + vc_data['bot_count']
-            
-            if new_limit <= 99:  # Discord の最大制限
-                await channel.edit(user_limit=new_limit)
+        vc_data = self.active_vcs.get(channel.id)
+        if not isinstance(vc_data, dict):
+            logger.warning(f"handle_bot_join: 想定外のvc_data形式: {type(vc_data)} (channel_id={channel.id})")
+            return
+
+        try:
+            vc_type = vc_data.get('vc_type')
+
+            # キーが欠けている／型が変でも安全に扱う
+            bot_count_raw = vc_data.get('bot_count', 0)
+            try:
+                bot_count = int(bot_count_raw)
+            except (ValueError, TypeError):
+                logger.warning(f"handle_bot_join: 無効なbot_count値: {bot_count_raw} (channel_id={channel.id})")
+                bot_count = 0
+
+            original_limit_raw = vc_data.get('original_limit', 0)
+            try:
+                original_limit = int(original_limit_raw)
+            except (ValueError, TypeError):
+                logger.warning(f"handle_bot_join: 無効なoriginal_limit値: {original_limit_raw} (channel_id={channel.id})")
+                original_limit = 0
+
+            # 人数指定タイプのみ処理
+            if vc_type == VCType.WITH_LIMIT:
+                bot_count += 1
+                vc_data['bot_count'] = bot_count
+                new_limit = original_limit + bot_count
+
+                # Discord の制限と下限をガード
+                if new_limit < 0:
+                    new_limit = 0
+                if new_limit > 99:
+                    new_limit = 99
+
+                try:
+                    await channel.edit(user_limit=new_limit)
+                except Exception as e:
+                    logger.warning(f"handle_bot_join: VC人数制限更新エラー (channel_id={channel.id}, new_limit={new_limit}): {e}")
+        except Exception as e:
+            logger.error(f"handle_bot_join 内部エラー (channel_id={channel.id}): {e}", exc_info=True)
     
     async def handle_bot_leave(self, channel: discord.VoiceChannel):
         """BOT退出時の人数制限調整"""
         if channel.id not in self.active_vcs:
             return
         
-        vc_data = self.active_vcs[channel.id]
-        
-        # 人数指定タイプのみ処理
-        if vc_data.get('vc_type') == VCType.LIMIT and vc_data['bot_count'] > 0:
-            vc_data['bot_count'] -= 1
-            original_limit = vc_data['original_limit']
-            new_limit = original_limit + vc_data['bot_count']
-            
-            await channel.edit(user_limit=new_limit)
+        vc_data = self.active_vcs.get(channel.id)
+        if not isinstance(vc_data, dict):
+            logger.warning(f"handle_bot_leave: 想定外のvc_data形式: {type(vc_data)} (channel_id={channel.id})")
+            return
+
+        try:
+            vc_type = vc_data.get('vc_type')
+            # キーが欠けている／型が変でも安全に扱う
+            bot_count_raw = vc_data.get('bot_count', 0)
+            try:
+                bot_count = int(bot_count_raw)
+            except (ValueError, TypeError):
+                logger.warning(f"handle_bot_leave: 無効なbot_count値: {bot_count_raw} (channel_id={channel.id})")
+                bot_count = 0
+
+            original_limit_raw = vc_data.get('original_limit', 0)
+            try:
+                original_limit = int(original_limit_raw)
+            except (ValueError, TypeError):
+                logger.warning(f"handle_bot_leave: 無効なoriginal_limit値: {original_limit_raw} (channel_id={channel.id})")
+                original_limit = 0
+
+            # 人数指定タイプのみ処理
+            if vc_type == VCType.WITH_LIMIT and bot_count > 0:
+                bot_count -= 1
+                vc_data['bot_count'] = bot_count
+                new_limit = original_limit + bot_count
+
+                # user_limitが0未満にならないようガード
+                if new_limit < 0:
+                    new_limit = 0
+
+                try:
+                    await channel.edit(user_limit=new_limit)
+                except Exception as e:
+                    logger.warning(f"handle_bot_leave: VC人数制限更新エラー (channel_id={channel.id}, new_limit={new_limit}): {e}")
+        except Exception as e:
+            logger.error(f"handle_bot_leave 内部エラー (channel_id={channel.id}): {e}", exc_info=True)
     
     async def log_vc_join(self, channel: discord.VoiceChannel, member: discord.Member):
         """VC参加をログに記録"""
@@ -1227,8 +1306,8 @@ class VCManager(commands.Cog):
         if guild.id not in self.vc_systems:
             self.vc_systems[guild.id] = {}
         
-        # カテゴリーIDがない場合はハブVCのIDを使用
-        storage_key = vc_target_category_id if vc_target_category_id else hub_vc.id
+        # storage_keyは常にhub_vc_idを使用（複数のVCシステムを区別するため）
+        storage_key = hub_vc.id
         final_notify_category_id = notify_category_id
 
         if notify_enabled and notify_category_new:
